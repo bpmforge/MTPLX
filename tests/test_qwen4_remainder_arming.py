@@ -159,7 +159,7 @@ def test_upstream_verify_lanes_read_at_use_not_frozen_at_import(monkeypatch):
 
 
 def test_the_fixed_m4_auto_arm_stamps_the_upstream_verify_lanes(tmp_path, monkeypatch):
-    """The fixed-M4 auto-arm stamps OPDIET, BLOCK_VERIFY and VERIFY_GLUE, and
+    """The fixed-M4 auto-arm stamps OPDIET and VERIFY_GLUE (not BLOCK_VERIFY, v2.11.3), and
     the readers (read at use, after the stamp is applied) arm.
 
     (DRAFT_K20_PRESCATTER is stamped only on a q8/g64 lm_head pack, gated by the
@@ -183,7 +183,10 @@ def test_the_fixed_m4_auto_arm_stamps_the_upstream_verify_lanes(tmp_path, monkey
     overrides = openai._server_runtime_env_overrides(args, {})
     assert normalize_runtime_env_overrides(overrides) == overrides
     assert overrides.get("MTPLX_QWEN4_OPDIET") == "1"
-    assert overrides.get("MTPLX_QWEN4_BLOCK_VERIFY") == "1"
+    # v2.11.3: the block verify is deliberately NOT auto-armed (it accepted
+    # 2.90 tokens/round against 3.00 for the standard verify on the reference
+    # workload); MTPLX_QWEN4_BLOCK_VERIFY=1 is the operator's opt-in.
+    assert overrides.get("MTPLX_QWEN4_BLOCK_VERIFY") is None
     assert overrides.get("MTPLX_QWEN4_VERIFY_GLUE") == "1"
     for key, value in overrides.items():
         monkeypatch.setenv(key, value)
