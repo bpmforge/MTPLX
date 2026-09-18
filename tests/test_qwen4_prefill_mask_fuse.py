@@ -92,6 +92,12 @@ def _clean_lane_state(monkeypatch):
 
 def _arm(monkeypatch, value: str = "1") -> None:
     monkeypatch.setenv(MASK_FUSE_ENV, value)
+    # Since v2.11.3 the verify band (q_len 3-8) is served by the head-chunked
+    # SDPA (PR #482, on by default) BEFORE it reaches the mask-fuse door, so
+    # the refusal these tests pin at VERIFY_ROWS is never asked. Switch the
+    # split off here: tests/test_qwen4_verify_sdpa_head_chunk.py covers it,
+    # and these tests are about the door alone.
+    monkeypatch.setenv("MTPLX_QWEN4_VERIFY_SDPA_HEAD_CHUNK", "0")
 
 
 def _lane_mask(pos_start: int, rows: int, total: int) -> mx.array:
