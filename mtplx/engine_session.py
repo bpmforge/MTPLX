@@ -165,6 +165,32 @@ def _session_bank_max_entries() -> int:
     return _bank_entries_from_env("MTPLX_SESSION_BANK_MAX_ENTRIES", default)
 
 
+def session_bank_idle_ttl_s() -> float:
+    """MTPLX_SESSION_BANK_IDLE_TTL_S: seconds a warm entry (and its session)
+    may sit untouched before the idle sweep drops it. Default 3600. ``0``
+    disables the sweep: entries then live until the byte budgets, real
+    memory pressure or a restart take them (the SSD tier still keeps them).
+    Issue #481 asked for this knob; nothing else in the daemon expires warm
+    state on idle time alone.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_IDLE_TTL_S")
+    if raw is None or not str(raw).strip():
+        return float(DEFAULT_IDLE_TTL_S)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "MTPLX_SESSION_BANK_IDLE_TTL_S=%r is not a number; using %s",
+            raw,
+            DEFAULT_IDLE_TTL_S,
+        )
+        return float(DEFAULT_IDLE_TTL_S)
+    if value != value:  # NaN
+        return float(DEFAULT_IDLE_TTL_S)
+    # SessionBank rejects <= 0 (idle_ttl_s must be > 0); infinity is "never".
+    return value if value > 0 else float("inf")
+
+
 def _default_per_session_max_bytes() -> int:
     total_ram = _detect_total_ram_bytes_for_session_bank()
     if (
@@ -334,17 +360,49 @@ def resolve_session_bank_max_bytes(
     return DEFAULT_MAX_BYTES, False
 
 
+def per_session_play_ceiling_bytes(memory_plan: Any | None) -> int | None:
+    """The largest one-conversation snapshot the plan can restore.
+
+    A restore materializes the snapshot next to the banked copy, so one
+    session's warm state must fit twice in the play the engine budget
+    leaves after the weights and the runtime transients:
+    (usable - weights - RUNTIME_TRANSIENTS) / 2. PR #496 (Dizzler7) asked
+    for a flat 32 GiB so a 12 GiB deep-context snapshot (Qwen3.8-27B, Q8 KV,
+    >100k tokens) stops being refused on the 8 GiB tier; a flat number is
+    swap death on a 64 GB seat, this is the same ask sized by the machine:
+    64 GB + 27B: 13.2 GiB; 128 GB + 27B: 37 GiB (the budget rule then
+    holds it at 32); 128 GB + Flash-Next: 10.5 GiB; 48 GB + 27B: 7.2 GiB.
+    None without a plan (legacy tier ceilings apply).
+    """
+    if memory_plan is None or not getattr(memory_plan, "available", False):
+        return None
+    try:
+        from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+        usable = int(getattr(memory_plan, "usable_bytes", 0) or 0)
+        weights = int(getattr(memory_plan, "model_weights_bytes", 0) or 0)
+    except (ImportError, TypeError, ValueError):
+        return None
+    if usable <= 0 or weights <= 0:
+        return None
+    play = usable - weights - int(RUNTIME_TRANSIENTS_BYTES)
+    return max(_AUTO_BUDGET_FLOOR_BYTES, play // 2)
+
+
 def resolve_session_bank_per_session_bytes(
     max_bytes: int,
     *,
     auto_active: bool = True,
+    memory_plan: Any | None = None,
 ) -> int:
     """Per-session cap resolution.
 
     Explicit env wins (clamped to the bank budget when the budget was
     auto-computed). In auto mode the default is 2/3 of the budget so one
-    conversation cannot monopolize the whole cache; in legacy mode the
-    RAM-tiered defaults are preserved exactly.
+    conversation cannot monopolize the whole cache, held under what the
+    machine can restore: the plan's play ceiling when a memory plan is
+    available (``per_session_play_ceiling_bytes``), else the RAM-tier
+    ceiling; in legacy mode the RAM-tiered defaults are preserved exactly.
     """
     raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES")
     if raw is not None and raw.strip() and not _is_auto_bytes_setting(raw):
@@ -354,15 +412,19 @@ def resolve_session_bank_per_session_bytes(
         )
         return min(parsed, int(max_bytes)) if auto_active else parsed
     if auto_active:
-        # 2/3 of the bank budget, additionally clamped to the RAM-tier
-        # ceiling (8 GiB below 96 GiB RAM, 24 GiB above). The auto rule on
-        # its own RAISED the admission gate on small boxes relative to the
-        # v1.0.4 flat gate (64 GB Mac: 15 GiB vs 8 GiB), admitting snapshots
-        # whose restore-time transient copies blow past physical RAM (#150,
-        # ArthoPacini). Oversized snapshots still get the live-ref lease
-        # fallback, so warm reuse survives the clamp.
+        # 2/3 of the bank budget. The auto rule on its own RAISED the
+        # admission gate on small boxes relative to the v1.0.4 flat gate
+        # (64 GB Mac: 15 GiB vs 8 GiB), admitting snapshots whose
+        # restore-time transient copies blow past physical RAM (#150,
+        # ArthoPacini); the ceiling below is that restore copy priced by
+        # the plan, or the RAM tier (8 GiB below 96 GiB RAM, 24 GiB above)
+        # when there is no plan. Oversized snapshots still get the live-ref
+        # lease fallback, so warm reuse survives the clamp.
         auto_cap = max(_AUTO_BUDGET_FLOOR_BYTES, int(max_bytes) * 2 // 3)
-        return min(auto_cap, _default_per_session_max_bytes())
+        ceiling = per_session_play_ceiling_bytes(memory_plan)
+        if ceiling is None:
+            ceiling = _default_per_session_max_bytes()
+        return min(auto_cap, ceiling)
     return _default_per_session_max_bytes()
 
 
@@ -1600,11 +1662,13 @@ class EngineSessionManager:
         self,
         *,
         bank: SessionBank | None = None,
-        idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
+        idle_ttl_s: float | None = None,
         cold_tier: Any | None = None,
         model_weights_bytes: int | None = None,
         memory_plan: Any | None = None,
     ) -> None:
+        if idle_ttl_s is None:
+            idle_ttl_s = session_bank_idle_ttl_s()
         # Byte caps resolve model-aware by default (v2): unset or "auto" env
         # gives the bank half of the RAM surplus left after the model weights
         # (floored 1 GiB, capped 48 GiB), so a 32 GB Mac never inherits the
@@ -1625,6 +1689,7 @@ class EngineSessionManager:
                 per_session_max_bytes=resolve_session_bank_per_session_bytes(
                     resolved_max_bytes,
                     auto_active=auto_active,
+                    memory_plan=memory_plan,
                 ),
                 idle_ttl_s=idle_ttl_s,
                 cold_tier=cold_tier,

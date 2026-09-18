@@ -1716,6 +1716,38 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(chat.arguments.contains("--adaptive-policy"))
     }
 
+    func testCommandBuilderLaunchesFlashNextAtTheChosenDepthUnlessTheSwitchIsOn() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        // Flash-Next resolves by name (qwen4_exp) without local metadata.
+        let flashNext = "/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed"
+        var configuration = MTPLXAppConfiguration(
+            executablePath: fake.path, model: flashNext, profile: "sustained")
+        XCTAssertNil(configuration.adaptiveDepth)
+        // Unset: the Pi and Hermes presets' expected_value stays home on
+        // this family (measured 7 to 8 percent slower than fixed depth 3).
+        for target in [LaunchTarget.hermes, .pi, .chat] {
+            let command = try builder.buildServeCommand(
+                configuration: configuration, target: target, launchID: "unset-\(target)")
+            XCTAssertFalse(
+                command.arguments.contains("--adaptive-policy"),
+                "\(target) passed a depth policy for Flash-Next with the switch unset")
+        }
+        // On: the switch names the policy on every target, this family included.
+        configuration.adaptiveDepth = true
+        let on = try builder.buildServeCommand(
+            configuration: configuration, target: .hermes, launchID: "on-hermes")
+        XCTAssertTrue(on.arguments.containsInOrder(["--adaptive-policy", "expected_value"]))
+        // Off: still explicit, so a relaunch cannot inherit a policy.
+        configuration.adaptiveDepth = false
+        let off = try builder.buildServeCommand(
+            configuration: configuration, target: .pi, launchID: "off-pi")
+        XCTAssertTrue(off.arguments.containsInOrder(["--adaptive-policy", "none"]))
+    }
+
     func testAppConfigurationMigratesLegacyPinnedFansToMax() throws {
         let configuration = try JSONDecoder().decode(
             MTPLXAppConfiguration.self,
@@ -2391,7 +2423,8 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"])
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"])
         XCTAssertNil(command.environment["MTPLX_LONG_CONTEXT_MTP_DEPTH"])
-        XCTAssertEqual(command.environment["MTPLX_LAZY_BONUS_VERIFY"], "1")
+        XCTAssertNil(command.environment["MTPLX_LAZY_TARGET_DISTRIBUTIONS"])
+        XCTAssertNil(command.environment["MTPLX_LAZY_BONUS_VERIFY"])
         // #282 passthrough: the app must not export the compaction battery —
         // explicit envs re-arm those compactors past the engine default.
         XCTAssertNil(command.environment["MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS"])
@@ -2696,7 +2729,8 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "auto")
         XCTAssertEqual(command.environment["MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S"], "30.0")
         XCTAssertEqual(command.environment["MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS"], "4096")
-        XCTAssertEqual(command.environment["MTPLX_LAZY_BONUS_VERIFY"], "1")
+        XCTAssertNil(command.environment["MTPLX_LAZY_TARGET_DISTRIBUTIONS"])
+        XCTAssertNil(command.environment["MTPLX_LAZY_BONUS_VERIFY"])
         XCTAssertEqual(command.environment["MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"], "1")
         XCTAssertEqual(command.environment["MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"], "1")
         // #282 passthrough: the coding-agent lane no longer exports the
@@ -3225,7 +3259,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(envText.contains("Never print token"))
         XCTAssertTrue(envText.contains("OPENAI_BASE_URL=\"http://127.0.0.1:8123/v1\""))
         XCTAssertTrue(envText.contains("HERMES_WORKSPACE=\"\(workspace.path)\""))
-        XCTAssertTrue(envText.contains("TERMINAL_CWD=\"\(workspace.path)\""))
+        XCTAssertFalse(envText.contains("TERMINAL_CWD="), "deprecated .env key must not be written; terminal.cwd in config.yaml carries the workspace")
         XCTAssertTrue(envText.contains("HERMES_SESSION_PLATFORM=\"mtplx-app\""))
         XCTAssertTrue(envText.contains("TELEGRAM_BOT_TOKEN=\"fake-token\""))
         XCTAssertTrue(envText.contains("TELEGRAM_ALLOWED_USERS=\"123,456\""))
@@ -3978,6 +4012,16 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
+    func testOpenCodeOutputLimitReservesHalfTheWindow() {
+        // Issue #480: OpenCode reserves the output limit out of the context
+        // before deciding whether the conversation still fits; equal numbers
+        // left a zero-token window on small seats.
+        XCTAssertEqual(OpenCodeIntegration.outputLimit(forContextWindow: 8_192), 4_096)
+        XCTAssertEqual(OpenCodeIntegration.outputLimit(forContextWindow: 32_768), 16_384)
+        XCTAssertEqual(OpenCodeIntegration.outputLimit(forContextWindow: 262_144), 32_000)
+        XCTAssertEqual(OpenCodeIntegration.outputLimit(forContextWindow: 1), 1)
+    }
+
     func testOfficialModelCatalogIncludesOptimizedQualityFP16() throws {
         let quality = try XCTUnwrap(
             MTPLXModelOption.option(matching: "mtplx-qwen36-27b-optimized-quality-fp16")
@@ -4241,13 +4285,19 @@ final class MTPLXAppCoreTests: XCTestCase {
             localCandidates: [model.path]
         )
 
-        XCTAssertEqual(option.installedLocalPath, model.path)
+        // The library is pinned to the temporary root: on a Mac that has this
+        // pack installed in the default library, the ordered library search
+        // (PR #387) would otherwise answer with that copy before the
+        // explicit candidate and the assertion would read the machine, not
+        // the code.
+        let library = ModelLibrary(primaryDirectory: root.path)
+        XCTAssertEqual(option.installedLocalPath(in: library), model.path)
 
         setenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN", "1", 1)
         defer { unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN") }
 
-        XCTAssertNil(option.installedLocalPath)
-        XCTAssertEqual(option.resolvedReference, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed")
+        XCTAssertNil(option.installedLocalPath(in: library))
+        XCTAssertEqual(option.resolvedReference(in: library), "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed")
     }
 
     func testModelInstallDetectionRespectsLaunchHomeForTildeCandidates() throws {
@@ -4320,6 +4370,51 @@ final class MTPLXAppCoreTests: XCTestCase {
             catalog.filter { $0.matches("Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed") }.count,
             1
         )
+    }
+
+    func testRemoveCustomModelByIDPreservesUnrelatedModelsAndOfficialCatalog() throws {
+        var config = MTPLXAppConfiguration()
+        config.rememberCustomModel(repoID: "Foo/Bar")
+        config.rememberCustomModel(repoID: "Foo/Baz")
+        let officialIDs = Set(MTPLXModelOption.officialCatalog.map(\.id))
+        let removedID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: removedID))
+        XCTAssertFalse(config.customModels.contains { $0.id == removedID })
+        XCTAssertEqual(config.customModels.map(\.hfModelID), ["Foo/Baz"])
+        XCTAssertEqual(Set(MTPLXModelOption.officialCatalog.map(\.id)), officialIDs)
+        XCTAssertFalse(config.removeCustomModel(id: "missing-model"))
+    }
+
+    func testRemovingCustomModelDoesNotDeleteItsLocalFiles() throws {
+        let directory = temporaryDirectory().appendingPathComponent("custom-model", isDirectory: true)
+        let file = directory.appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var config = MTPLXAppConfiguration()
+        config.rememberForgedModel(brandedName: "Custom", localPath: directory.path)
+        let modelID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: modelID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testRemovingCurrentCustomRegistrationPreservesCurrentModelSynthesis() throws {
+        var config = MTPLXAppConfiguration()
+        config.rememberCustomModel(repoID: "Foo/Current")
+        config.model = "Foo/Current"
+        let modelID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: modelID))
+        let catalog = MTPLXModelOption.pickerCatalog(
+            customModels: config.customModels,
+            currentModel: config.model
+        )
+
+        XCTAssertTrue(catalog.contains { $0.matches(config.model) })
     }
 
     func testCommandBuilderEmitsBatchingRuntimeSettings() throws {
@@ -10757,7 +10852,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
-    func testPreflightMovesPortAwayFromForeignOccupantAndPersists() async throws {
+    func testPreflightMovesPortAwayFromForeignOccupantWithoutPersisting() async throws {
         let occupiedPort = try freeTCPPort()
         let garbage = try startGarbageHTTPServer(port: occupiedPort)
         defer { garbage.terminate() }
@@ -10781,8 +10876,12 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(fallbackNotice.contains("another app"), fallbackNotice)
         XCTAssertTrue(fallbackNotice.contains("\(occupiedPort)"), fallbackNotice)
         XCTAssertTrue(fallbackNotice.contains("\(port)"), fallbackNotice)
-        let persisted = try MTPLXSettingsStore(settingsURL: settingsURL).load()
-        XCTAssertEqual(persisted.port, port)
+        // Issue #503: the fallback is for this launch only; settings keep
+        // the configured port so pinned clients find the daemon again.
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: settingsURL.path),
+            "a port fallback must never be persisted"
+        )
     }
 
     /// Issue #409: a foreign-looking occupant that clears inside the settle
@@ -10841,8 +10940,124 @@ final class MTPLXAppCoreTests: XCTestCase {
             fallbackNotice.contains("an MTPLX server started outside the app"),
             fallbackNotice
         )
-        let persisted = try MTPLXSettingsStore(settingsURL: settingsURL).load()
-        XCTAssertEqual(persisted.port, port)
+        // Issue #503: the fallback is for this launch only; settings keep
+        // the configured port so pinned clients find the daemon again.
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: settingsURL.path),
+            "a port fallback must never be persisted"
+        )
+    }
+
+    /// Issue #503: a daemon this app launched that wedged mid-inference keeps
+    /// its listener while /health never answers; by probe alone it reads as
+    /// "another app" and the app used to move, and persist, the port. The
+    /// launch marker in its environment says it is ours: reap it in place and
+    /// keep the configured port.
+    func testPreflightReapsWedgedAppOwnedDaemonAndKeepsConfiguredPort() async throws {
+        let occupiedPort = try freeTCPPort()
+        let wedged = try startWedgedListener(port: occupiedPort, launchID: "wedged-launch")
+        defer { if wedged.isRunning { wedged.terminate() } }
+        let kind = try await waitForNonFreeClassification(port: occupiedPort)
+        XCTAssertEqual(kind, .foreign)
+        let owner = PortPreflight.appOwnedListener(port: occupiedPort)
+        XCTAssertEqual(owner?.launchID, "wedged-launch")
+        XCTAssertEqual(owner?.pid, wedged.processIdentifier)
+        let settingsURL = temporaryDirectory().appendingPathComponent("settings.json")
+
+        let backend = await MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(port: occupiedPort),
+            settingsStore: MTPLXSettingsStore(settingsURL: settingsURL)
+        )
+        await MainActor.run { backend.portSettleTimeoutSeconds = 0.5 }
+        let (port, notice) = await backend.preflightOutcomeForTest(
+            target: nil,
+            launchID: "test-launch"
+        )
+
+        XCTAssertEqual(port, occupiedPort)
+        XCTAssertNil(notice)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: settingsURL.path))
+        let deadline = Date().addingTimeInterval(5)
+        while wedged.isRunning, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTAssertFalse(wedged.isRunning, "the wedged app-owned daemon must be reaped")
+        XCTAssertTrue(PortPreflight.portIsBindable(occupiedPort))
+    }
+
+    /// Issue #503: a listener without the app's launch marker is not ours to
+    /// reap, wedged or not (a CLI-started `mtplx serve`, a stranger's app).
+    func testPreflightNeverReapsAWedgedListenerWithoutTheLaunchMarker() async throws {
+        let occupiedPort = try freeTCPPort()
+        let wedged = try startWedgedListener(port: occupiedPort, launchID: nil)
+        defer { wedged.terminate() }
+        _ = try await waitForNonFreeClassification(port: occupiedPort)
+        XCTAssertNil(PortPreflight.appOwnedListener(port: occupiedPort))
+        let settingsURL = temporaryDirectory().appendingPathComponent("settings.json")
+
+        let backend = await MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(port: occupiedPort),
+            settingsStore: MTPLXSettingsStore(settingsURL: settingsURL)
+        )
+        await MainActor.run { backend.portSettleTimeoutSeconds = 0.5 }
+        let (port, notice) = await backend.preflightOutcomeForTest(
+            target: nil,
+            launchID: "test-launch"
+        )
+
+        XCTAssertTrue(wedged.isRunning, "a listener without our marker is never signalled")
+        XCTAssertNotEqual(port, occupiedPort)
+        XCTAssertNotNil(notice)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: settingsURL.path))
+    }
+
+    /// Issue #503: a fallback port is never persisted. Settings keep the
+    /// configured port, a save made meanwhile writes the configured port
+    /// back, changing the port on purpose still wins, and the next
+    /// user-initiated start tries the configured port again.
+    func testPortFallbackIsNotPersistedAndLaterSavesKeepTheConfiguredPort() async throws {
+        let occupiedPort = try freeTCPPort()
+        let garbage = try startGarbageHTTPServer(port: occupiedPort)
+        defer { garbage.terminate() }
+        _ = try await waitForNonFreeClassification(port: occupiedPort)
+        let settingsURL = temporaryDirectory().appendingPathComponent("settings.json")
+
+        let backend = await MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(port: occupiedPort),
+            settingsStore: MTPLXSettingsStore(settingsURL: settingsURL)
+        )
+        await MainActor.run { backend.portSettleTimeoutSeconds = 0.5 }
+        let (port, notice) = await backend.preflightOutcomeForTest(
+            target: nil,
+            launchID: "test-launch"
+        )
+        XCTAssertNotEqual(port, occupiedPort)
+        let fallbackNotice = try XCTUnwrap(notice)
+        XCTAssertTrue(fallbackNotice.contains("for now"), fallbackNotice)
+        XCTAssertTrue(fallbackNotice.contains("\(occupiedPort)"), fallbackNotice)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: settingsURL.path))
+
+        // An unrelated save while on the fallback writes the configured port.
+        try await MainActor.run {
+            var next = backend.configuration
+            next.automaticDaemonRestart.toggle()
+            try backend.saveSettings(next)
+        }
+        var persisted = try MTPLXSettingsStore(settingsURL: settingsURL).load()
+        XCTAssertEqual(persisted.port, occupiedPort)
+        await MainActor.run {
+            XCTAssertEqual(backend.configuration.port, port, "this launch stays on the fallback")
+        }
+
+        // Changing the port on purpose is the user's decision and persists.
+        let chosen = try freeTCPPort()
+        try await MainActor.run {
+            var next = backend.configuration
+            next.port = chosen
+            try backend.saveSettings(next)
+        }
+        persisted = try MTPLXSettingsStore(settingsURL: settingsURL).load()
+        XCTAssertEqual(persisted.port, chosen)
     }
 
     func testPreflightLeavesAdoptableAppOwnedDaemonAlone() async throws {
@@ -11493,6 +11708,38 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
         let process = Process()
         process.executableURL = script
+        try process.run()
+        return process
+    }
+
+    /// A listener that accepts connections and never answers: the shape of a
+    /// daemon wedged mid-inference (issue #503). With `launchID` it carries
+    /// the app's launch marker in its environment, exactly as the supervisor
+    /// launches a daemon; without it, it is a stranger's process.
+    private func startWedgedListener(port: Int, launchID: String?) throws -> Process {
+        let script = try makeExecutable(
+            named: "fake-wedged-listener",
+            body: """
+            #!/bin/sh
+            exec python3 -u - <<'PY'
+            import socket, time
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", \(port)))
+            s.listen(16)
+            time.sleep(3600)
+            PY
+            """
+        )
+        let process = Process()
+        process.executableURL = script
+        var environment = ProcessInfo.processInfo.environment
+        if let launchID {
+            environment["MTPLX_APP_LAUNCH_ID"] = launchID
+        } else {
+            environment.removeValue(forKey: "MTPLX_APP_LAUNCH_ID")
+        }
+        process.environment = environment
         try process.run()
         return process
     }

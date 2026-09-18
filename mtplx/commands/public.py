@@ -26,6 +26,7 @@ import importlib.metadata
 import importlib.util
 import re
 import webbrowser
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -355,8 +356,9 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
         "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
         "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
-        "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
-        "MTPLX_LAZY_BONUS_VERIFY": "1",
+        # Model/profile defaults own distribution evaluation and verify
+        # width. Generic lazy pins mask Flash-Next's batched fixed-M4 lane;
+        # enabling lazy bonus alone shortens D3 to an eager three-row window.
         "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
         "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
         # The read-inspection compaction battery is gone (#282): an explicit
@@ -2245,19 +2247,72 @@ def _git_value(args: list[str], *, cwd: Path) -> str | None:
     return proc.stdout.strip()
 
 
+def _validate_retrieval_models(args: Any) -> int | None:
+    """Refuse to launch when a --embedding-model/--reranker-model is missing.
+
+    The chat model is resolved here before the server child is started; the
+    retrieval references stay symbolic and used to be resolved only on the
+    first request, so a typo produced a daemon that said "MTPLX is ready" and
+    then answered HTTP 500 on /v1/embeddings. The server refuses the same
+    references too (a direct `python -m mtplx.server.openai` never passes
+    through here), but failing in the CLI is what puts the `mtplx pull` hint
+    in front of the user before any model load happens.
+    """
+
+    if not (
+        getattr(args, "embedding_model", None) or getattr(args, "reranker_model", None)
+    ):
+        return None
+    from mtplx.retrieval import registry_from_args
+
+    try:
+        failures = registry_from_args(args).unresolved()
+    except Exception as exc:
+        # A malformed REF=SERVED_ID value is a launch error too, and it is
+        # better named here than as an argparse-shaped failure in the child.
+        _print_serve_start_line(f"error: {exc}")
+        return 2
+    if not failures:
+        return None
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    flags = {"embedding": "--embedding-model", "rerank": "--reranker-model"}
+    for spec, reason in failures:
+        _print_serve_start_line(f"error: {reason}")
+        _print_serve_start_line(
+            f"flag: {flags.get(spec.role, spec.role)} {spec.model_ref}"
+        )
+        # A local path cannot be pulled; the loader message already says the
+        # path is missing, so only a repo id gets the download hint.
+        repo_id = repo_id_from_model_ref(spec.model_ref)
+        if repo_id:
+            _print_serve_start_line(f"try: mtplx pull {repo_id}")
+    return 1
+
+
 def _resolve_runtime_model_path(
-    model: str, *, cache_dir: str | None = None
+    model: str,
+    *,
+    cache_dir: str | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     from mtplx.hf_loader import resolve_model_path
 
     try:
-        return str(resolve_model_path(model, cache_dir=cache_dir)), None
+        return str(
+            resolve_model_path(model, cache_dir=cache_dir, search_dirs=search_dirs)
+        ), None
     except Exception as exc:
         return model, {
             "error": "model is not available locally",
             "model": model,
             "detail": str(exc),
         }
+
+
+def _model_search_kwargs(args: Any) -> dict[str, Any]:
+    search_dirs = getattr(args, "model_search_dirs", None)
+    return {"search_dirs": search_dirs} if search_dirs else {}
 
 
 def _exactness_profile_kwargs(args: Any) -> dict[str, Any]:
@@ -2502,7 +2557,10 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
 
     report = {
         "environment": env,
-        "huggingface": hf_cache_report(cache_dir=getattr(args, "model_cache", None)),
+        "huggingface": hf_cache_report(
+            cache_dir=getattr(args, "model_cache", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
+        ),
         "thermal_control": thermal_control,
         "tools": {
             "python": sys.executable,
@@ -2522,6 +2580,7 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     report["diagnostics"] = build_diagnostics_payload(
         model_cache=getattr(args, "model_cache", None),
+        model_search_dirs=getattr(args, "model_search_dirs", None),
         include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
         # An explicit --port aims the server checks; the bare default (8008)
@@ -2584,6 +2643,9 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
         )
         print(f"project: {env_info.get('project_root') or os.getcwd()}")
         print(f"model cache: {hf.get('cache_dir') or 'default'}")
+        model_roots = [str(root) for root in hf.get("model_roots") or ()]
+        if len(model_roots) > 1:
+            print(f"model roots (search order): {', '.join(model_roots)}")
         print(f"cached models: {hf.get('cached_models', 'unknown')}")
         token_source = hf.get("token_source")
         if token_source == "environment":
@@ -2859,6 +2921,95 @@ def cmd_stop_public(args: Any) -> int:
     }
     emit(result, lines=reason_lines.get(reason, [f"Could not stop: {reason}"]))
     return 1
+
+
+def cmd_gc_public(args: Any) -> int:
+    """Reconcile the SessionBank SSD cold tier against its manifest (#493).
+
+    Read-only by default: prints/returns what is orphaned without deleting
+    anything. Pass --apply to actually delete. A concurrently running
+    server can commit a new entry between this scan and its delete, so a
+    server found running on the probed ports blocks --apply unless --force
+    is also given.
+    """
+
+    from mtplx.cache_bank.reconcile import DEFAULT_COLD_TIER_DIR, collect_garbage
+
+    json_output = bool(getattr(args, "json", False))
+    apply = bool(getattr(args, "apply", False))
+    force = bool(getattr(args, "force", False))
+    base_dir = getattr(args, "dir", None) or _configured_session_bank_dir() or DEFAULT_COLD_TIER_DIR
+
+    def emit(payload: dict[str, Any], *, lines: list[str]) -> None:
+        if json_output:
+            _print(payload)
+        else:
+            for line in lines:
+                print(line)
+
+    if apply and not force:
+        from mtplx.daemon_client import default_probe_ports, probe_running_daemons
+
+        host = str(getattr(args, "host", "127.0.0.1"))
+        daemons = probe_running_daemons(host=host, ports=default_probe_ports())
+        if daemons:
+            emit(
+                {"ok": False, "reason": "server_running", "ports": [d.port for d in daemons]},
+                lines=[
+                    (
+                        "A MTPLX server is currently running "
+                        f"(port {daemons[0].port}). A session committed while "
+                        "this runs could have its blobs deleted."
+                    ),
+                    (
+                        "Stop the server first (mtplx stop), or pass --force "
+                        "to proceed anyway."
+                    ),
+                ],
+            )
+            return 1
+
+    report = collect_garbage(base_dir, dry_run=not apply)
+    orphan_entries = len(report["orphan_entry_dirs"])
+    orphan_blobs = report["orphan_blob_files"]
+    orphan_bytes = report["orphan_file_bytes"]
+    live_bytes = max(0, report["disk_bytes"] - report["database_disk_bytes"])
+    verb = "Deleted" if apply else "Would delete"
+    lines = [
+        (
+            f"{verb} {orphan_entries} orphaned entry dir(s), "
+            f"{orphan_blobs} orphaned blob file(s), "
+            f"{orphan_bytes / 1e9:.2f} GB "
+            f"(evicted_entries/: {report['evicted_entries_bytes'] / 1e9:.2f} GB) "
+            f"in {report['base_dir']}."
+        ),
+        (
+            f"{report['entries']} live entr{'y' if report['entries'] == 1 else 'ies'}, "
+            f"{live_bytes / 1e9:.2f} GB on disk after cleanup."
+            if apply
+            else f"{report['entries']} live entr{'y' if report['entries'] == 1 else 'ies'}, "
+            f"{live_bytes / 1e9:.2f} GB on disk."
+        ),
+    ]
+    if not report["manifest_found"]:
+        lines.append("No manifest.sqlite: nothing in this directory is restorable.")
+    if not apply and (orphan_entries or orphan_blobs or report["evicted_entries_bytes"]):
+        lines.append("Re-run with --apply to delete.")
+    emit(report, lines=lines)
+    return 0
+
+
+def _configured_session_bank_dir() -> str | None:
+    """The SSD session-cache directory the saved config points the daemon at."""
+
+    try:
+        from mtplx.config import load_user_config
+
+        value = getattr(load_user_config(), "ssd_session_cache_dir", None)
+    except (OSError, ValueError, ImportError):
+        return None
+    value = str(value or "").strip()
+    return value or None
 
 
 def _parse_settings_pairs(pairs: list[str]) -> tuple[dict[str, Any], list[str]]:
@@ -3551,6 +3702,7 @@ def _cmd_tune(
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return _tune_error(
@@ -3803,6 +3955,7 @@ def _cmd_tune_candidate(args: Any) -> int:
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         _print(resolve_error)
@@ -4203,6 +4356,7 @@ def _tune_state_context_for_args(
     model, resolve_error = _resolve_runtime_model_path(
         _tune_requested_model(args),
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return None
@@ -5759,13 +5913,15 @@ def cmd_pull_public(args: Any) -> int:
         )
         progress_interval_s = 0.4
     try:
-        result = pull_model(
-            args.model,
-            cache_dir=args.cache_dir,
-            revision=args.revision,
-            progress_callback=callback,
-            progress_interval_s=progress_interval_s,
-        )
+        pull_kwargs = {
+            "cache_dir": args.cache_dir,
+            "revision": args.revision,
+            "progress_callback": callback,
+            "progress_interval_s": progress_interval_s,
+        }
+        if hasattr(args, "download_backend"):
+            pull_kwargs["download_backend"] = args.download_backend
+        result = pull_model(args.model, **pull_kwargs)
     except KeyboardInterrupt:
         finalize()
         if progress_json:
@@ -5822,19 +5978,28 @@ def cmd_pull_public(args: Any) -> int:
 
 
 def _cmd_models_check(args: Any) -> int:
-    from mtplx.hf_loader import model_cache_dir
+    from mtplx.hf_loader import model_library_roots
     from mtplx.model_updates import (
         ENGINE_VERSION,
         STATE_UPDATE_AVAILABLE,
         check_model_updates,
     )
 
-    rows = check_model_updates(cache_dir=args.cache_dir)
+    roots = model_library_roots(
+        args.cache_dir, search_dirs=getattr(args, "model_search_dirs", None)
+    )
+    rows = check_model_updates(
+        cache_dir=args.cache_dir,
+        search_dirs=getattr(args, "model_search_dirs", None),
+    )
     stale = [row for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+    writable_stale = [row for row in stale if row.is_primary]
     payload = {
-        "cache_dir": str(model_cache_dir(args.cache_dir)),
+        "cache_dir": str(roots[0]),
+        "model_roots": [str(root) for root in roots],
         "engine_version": ENGINE_VERSION,
         "updates_available": len(stale),
+        "automatic_updates_available": len(writable_stale),
         "models": [row.to_dict() for row in rows],
     }
     if getattr(args, "json", False):
@@ -5856,8 +6021,13 @@ def _cmd_models_check(args: Any) -> int:
             print(f"  {row.note}")
         if row.state == "engine-update-required" and row.min_engine_version:
             print(f"  requires MTPLX >= {row.min_engine_version}")
-    if stale:
-        print(f"updates available: {len(stale)} — run: mtplx models --update")
+    if writable_stale:
+        print(f"updates available: {len(writable_stale)}; run: mtplx models --update")
+    elif stale:
+        print(
+            "updates exist only in read-only search roots; select one explicitly "
+            "with --cache-dir to update it"
+        )
     else:
         print("all tracked packs are current")
     return 0
@@ -5890,16 +6060,33 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
     manifest = fetch_models_manifest()
     if targets:
         repos = list(dict.fromkeys(targets))
+        tasks = [
+            (repo, installed_path if len(repos) == 1 else None) for repo in repos
+        ]
     else:
-        rows = check_model_updates(cache_dir=args.cache_dir, manifest=manifest)
-        repos = [row.repo_id for row in rows if row.state == STATE_UPDATE_AVAILABLE]
-        if not repos:
+        rows = check_model_updates(
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+            manifest=manifest,
+        )
+        tasks = [
+            (row.repo_id, str(row.path))
+            for row in rows
+            if row.state == STATE_UPDATE_AVAILABLE and row.is_primary
+        ]
+        repos = [repo for repo, _path in tasks]
+        if not tasks:
             if progress_json:
                 emit_progress_json({"event": "result", "updated": []})
             elif json_mode:
-                _print({"updated": [], "message": "all tracked packs are current"})
+                _print(
+                    {
+                        "updated": [],
+                        "message": "no updates are available in the writable primary root",
+                    }
+                )
             else:
-                print("all tracked packs are current")
+                print("no updates are available in the writable primary root")
             return 0
     if installed_path and len(repos) != 1:
         message = "--installed-path requires exactly one --update REPO"
@@ -5910,7 +6097,7 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
         return 2
     results: list[dict[str, Any]] = []
     failed = False
-    for repo in repos:
+    for repo, destination_path in tasks:
         callback = None
         finalize: Callable[[], None] = lambda: None  # noqa: E731
         if progress_json:
@@ -5926,7 +6113,7 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
             result = update_cached_model(
                 repo,
                 cache_dir=args.cache_dir,
-                destination_path=installed_path,
+                destination_path=destination_path,
                 manifest=manifest,
                 progress_callback=callback,
                 progress_interval_s=0.4 if callback else 10.0,
@@ -5970,15 +6157,28 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
 
 
 def cmd_list_public(args: Any) -> int:
-    from mtplx.hf_loader import list_cached_models, model_cache_dir
+    from mtplx.hf_loader import list_cached_models, model_library_roots
 
     update_targets = getattr(args, "update", None)
     if update_targets is not None:
         return _cmd_models_update(args, update_targets)
     if getattr(args, "check", False):
         return _cmd_models_check(args)
-    models = [row.to_dict() for row in list_cached_models(cache_dir=args.cache_dir)]
-    payload = {"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models}
+    roots = model_library_roots(
+        args.cache_dir, search_dirs=getattr(args, "model_search_dirs", None)
+    )
+    models = [
+        row.to_dict()
+        for row in list_cached_models(
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+        )
+    ]
+    payload = {
+        "cache_dir": str(roots[0]),
+        "model_roots": [str(root) for root in roots],
+        "models": models,
+    }
     if getattr(args, "json", False):
         _print(payload)
     else:
@@ -6007,13 +6207,19 @@ def cmd_remove_public(args: Any) -> int:
     # traversal ref is refused before we offer to delete anything.
     try:
         repo_id, target = resolve_cached_model_target(
-            args.model, cache_dir=args.cache_dir
+            args.model,
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        if getattr(args, "json", False):
+            _print({"error": "remove failed", "model": args.model, "detail": str(exc)})
+            return 2
         print(f"mtplx remove: {exc}", file=sys.stderr)
         return 1
-    if target.exists() and not getattr(args, "yes", False):
-        size = _format_bytes(directory_size_bytes(target))
+    if (target.exists() or target.is_symlink()) and not getattr(args, "yes", False):
+        size_bytes = 0 if target.is_symlink() else directory_size_bytes(target)
+        size = _format_bytes(size_bytes)
         if not sys.stdin.isatty():
             print(
                 f"mtplx remove: refusing to delete {target} ({size}) without "
@@ -6029,7 +6235,24 @@ def cmd_remove_public(args: Any) -> int:
         if answer not in {"y", "yes"}:
             print("aborted: nothing was removed")
             return 1
-    result = remove_cached_model(args.model, cache_dir=args.cache_dir)
+    try:
+        result = remove_cached_model(
+            args.model,
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+        )
+    except (OSError, ValueError) as exc:
+        if getattr(args, "json", False):
+            _print(
+                {
+                    "error": "remove failed",
+                    "model": args.model,
+                    "detail": str(exc),
+                }
+            )
+        else:
+            print(f"error: remove failed: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         _print(result)
     else:
@@ -6115,6 +6338,7 @@ def _cmd_bench_run(args: Any) -> int:
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         _print(resolve_error)
@@ -9238,6 +9462,8 @@ def cmd_serve_public(args: Any) -> int:
 
         choice = run_serve_flow(
             configured_model=getattr(args, "model", None),
+            cache_dir=getattr(args, "cache_dir", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
             default_open_browser=bool(getattr(args, "open_browser", False)),
@@ -9478,6 +9704,7 @@ def cmd_serve_public(args: Any) -> int:
             runtime_model, resolution = _quickstart_resolve_model(
                 args.model,
                 cache_dir=cache_dir,
+                **_model_search_kwargs(args),
                 download=True,
             )
         except KeyboardInterrupt:
@@ -9515,6 +9742,7 @@ def cmd_serve_public(args: Any) -> int:
         runtime_model, resolve_error = _resolve_runtime_model_path(
             args.model,
             cache_dir=cache_dir,
+            **_model_search_kwargs(args),
         )
         if resolve_error is not None:
             _print_command_error(
@@ -9531,6 +9759,9 @@ def cmd_serve_public(args: Any) -> int:
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
+    retrieval_exit = _validate_retrieval_models(args)
+    if retrieval_exit is not None:
+        return retrieval_exit
     mode_exit = _apply_runtime_compatibility_mode(
         args,
         inspection,
@@ -9662,6 +9893,9 @@ def cmd_serve_public(args: Any) -> int:
         getattr(args, "embedding_model", None) or getattr(args, "reranker_model", None)
     ):
         cmd.extend(["--retrieval-cache-dir", str(retrieval_cache_dir)])
+    for root in getattr(args, "model_search_dirs", None) or ():
+        if str(root).strip():
+            cmd.extend(["--retrieval-model-root", str(root)])
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
@@ -10295,6 +10529,7 @@ def _generate_one_shot_public(
     runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return EXIT_TELEMETRY, resolve_error, []
@@ -10981,11 +11216,16 @@ def _quickstart_choose_model(
 
 
 def _quickstart_resolve_model(
-    model: str, *, cache_dir: str | None, download: bool
+    model: str,
+    *,
+    cache_dir: str | None,
+    search_dirs: Iterable[str | Path] | None = None,
+    download: bool,
 ) -> tuple[str | None, dict[str, Any]]:
-    runtime_model, resolve_error = _resolve_runtime_model_path(
-        model, cache_dir=cache_dir
-    )
+    resolve_kwargs: dict[str, Any] = {"cache_dir": cache_dir}
+    if search_dirs:
+        resolve_kwargs["search_dirs"] = search_dirs
+    runtime_model, resolve_error = _resolve_runtime_model_path(model, **resolve_kwargs)
     if resolve_error is None:
         return runtime_model, {
             "model": model,
@@ -11058,7 +11298,7 @@ def _quickstart_resolve_model(
     finally:
         finalize()
     runtime_model, resolve_error = _resolve_runtime_model_path(
-        download_ref, cache_dir=cache_dir
+        download_ref, **resolve_kwargs
     )
     if resolve_error is not None:
         return None, {
@@ -11736,7 +11976,11 @@ def _hermes_dotenv(
         f"HERMES_MTPLX_GATEWAY_STATUS_COMMAND={_hermes_dotenv_quote(HERMES_GATEWAY_STATUS_COMMAND)}\n"
         f"HERMES_MTPLX_GATEWAY_TRUTH_NOTE={_hermes_dotenv_quote(HERMES_GATEWAY_TRUTH_HINT)}\n"
         f"HERMES_WORKSPACE={_hermes_dotenv_quote(workspace_path)}\n"
-        f"TERMINAL_CWD={_hermes_dotenv_quote(workspace_path)}\n"
+        # The working directory lives in config.yaml as terminal.cwd (written
+        # above); Hermes v0.21 deprecates TERMINAL_CWD in .env and prints a
+        # migration warning on every launch while the line exists. Hermes
+        # bridges terminal.cwd into the TERMINAL_CWD process variable itself.
+        # SYNC PAIR: HermesIntegration.dotenv.
     )
 
 
@@ -12299,6 +12543,37 @@ def _client_config_refusal(client: str, exc: Exception) -> str:
     return f"{client} config left unchanged: {detail}. Fix or move that file, then try again."
 
 
+def _live_server_capabilities(
+    host: str,
+    port: int,
+    *,
+    api_key: str | None,
+    timeout: float = 1.5,
+) -> dict[str, Any]:
+    """What the daemon at ``host:port`` serves right now, from ``/health``.
+
+    ``mtplx connect`` names a host and a port, never a pack, so the pack
+    probe the quickstart lane uses has nothing to look at there. The daemon
+    reports its public model id and the same vision block the app reads;
+    when it answers, that is the source. Unreachable (or keyed off) answers
+    ``{}`` and callers keep the pack-metadata fallback (#472).
+    """
+    base = f"http://{_connect_host_for_bind(str(host))}:{int(port)}"
+    health = _http_json(base + "/health", timeout=timeout, api_key=api_key)
+    if not isinstance(health, dict) or not health.get("ok"):
+        return {}
+    live: dict[str, Any] = {}
+    live_model = (
+        health.get("model") or health.get("model_id") or health.get("served_model_id")
+    )
+    if live_model:
+        live["model_id"] = str(live_model).split("/", 1)[-1]
+    vision = health.get("vision")
+    if isinstance(vision, dict) and vision.get("enabled") is not None:
+        live["vision"] = bool(vision.get("enabled"))
+    return live
+
+
 def _model_vision_enabled(model_ref: str) -> bool:
     """True when the resolved model dir carries a servable vision tower.
 
@@ -12376,6 +12651,7 @@ def _quickstart_opencode_payload(
         detect_opencode_desktop,
         opencode_config_path,
         opencode_model_ref,
+        opencode_output_limit,
         write_opencode_config,
     )
 
@@ -12414,10 +12690,7 @@ def _quickstart_opencode_payload(
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
     )
     opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
-    output_limit = min(
-        context_window,
-        int(opencode_max_response_tokens or context_window),
-    )
+    output_limit = opencode_output_limit(context_window, opencode_max_response_tokens)
     max_response_suffix = (
         f"--max-response-tokens {int(opencode_max_response_tokens)} "
         if opencode_max_response_tokens is not None
@@ -13080,7 +13353,7 @@ def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("MTPLX_SESSION_BANK_PER_SESSION_BYTES", "auto")
     env.setdefault("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S", "30.0")
     env.setdefault("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", "4096")
-    env.setdefault("MTPLX_LAZY_BONUS_VERIFY", "1")
+    # Keep the model's verify width (the fixed-M4 lane needs the bonus row).
     env.setdefault("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", "1")
     env.setdefault("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", "1")
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "72")
@@ -13482,6 +13755,7 @@ def _quickstart_autoselect_busy_port(
             PORT_FOREIGN,
             app_configured_port,
             classify_port_occupant,
+            describe_foreign_listener,
             find_free_port,
             port_busy_advice,
             wait_for_port_settle,
@@ -13496,7 +13770,11 @@ def _quickstart_autoselect_busy_port(
         if occupant.kind != PORT_FOREIGN:
             return
         if configured:
-            for line in port_busy_advice(occupant, port=port):
+            # Issue #503: name the holder. A daemon the app launched that
+            # wedged (socket alive, /health dead) looks foreign by probe
+            # alone; the pid and the launch marker say what it is.
+            listener = describe_foreign_listener(port)
+            for line in port_busy_advice(occupant, port=port, listener=listener):
                 _quickstart_line(line)
             _quickstart_line(
                 f"Keeping the configured port {port} (never moved silently)."
@@ -14085,6 +14363,8 @@ def cmd_quickstart_public(args: Any) -> int:
         choice = run_quickstart_flow(
             fresh=fresh,
             configured_model=configured_model,
+            cache_dir=getattr(args, "cache_dir", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
             open_dashboard_override=explicit_open_dashboard,
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
@@ -14365,7 +14645,10 @@ def cmd_quickstart_public(args: Any) -> int:
     _quickstart_line(f"[1/4] Checking model: {model}")
     try:
         runtime_model, resolution = _quickstart_resolve_model(
-            model, cache_dir=cache_dir, download=download
+            model,
+            cache_dir=cache_dir,
+            **_model_search_kwargs(args),
+            download=download,
         )
     except KeyboardInterrupt:
         _quickstart_line("download cancelled")
@@ -14416,7 +14699,10 @@ def cmd_quickstart_public(args: Any) -> int:
             if answer in {"", "y", "yes"}:
                 try:
                     runtime_model, resolution = _quickstart_resolve_model(
-                        download_model, cache_dir=cache_dir, download=True
+                        download_model,
+                        cache_dir=cache_dir,
+                        **_model_search_kwargs(args),
+                        download=True,
                     )
                 except KeyboardInterrupt:
                     _quickstart_line("download cancelled")
@@ -14734,6 +15020,22 @@ def cmd_integrate_public(args: Any) -> int:
             write_opencode_config,
         )
 
+        # The daemon that answers on this port names the model id and the
+        # image-input flag; an explicit --model-id stays authoritative, and
+        # with no daemon the pack metadata for the id in hand answers, as
+        # before (#472: the port-only form advertised text-only before
+        # 2.11.2 and assumed the catalog default id after it).
+        live = _live_server_capabilities(
+            str(args.host), int(args.port), api_key=getattr(args, "api_key", None)
+        )
+        cli_flags = getattr(args, "_cli_flags", set()) or set()
+        if live.get("model_id") and "model-id" not in cli_flags:
+            model_id = str(live["model_id"])
+        vision = (
+            bool(live["vision"])
+            if "vision" in live
+            else _model_vision_enabled(str(getattr(args, "model", "") or model_id))
+        )
         api_key_suffix = _api_key_command_suffix(args)
         reasoning_policy = reasoning_policy_for_model(model_ref=model_id)
         payload = {
@@ -14742,6 +15044,7 @@ def cmd_integrate_public(args: Any) -> int:
             "base_url": api_base_url,
             "api_base_url": api_base_url,
             "model_id": model_id,
+            "live_server": live or None,
             "config_path": str(opencode_config_path()),
             "server_command": (
                 f"mtplx quickstart --profile {_resolved_default_profile_name(args)} --host {args.host} --port {args.port} "
@@ -14757,7 +15060,7 @@ def cmd_integrate_public(args: Any) -> int:
                     else "mtplx-local"
                 ),
                 enable_thinking=reasoning_policy.supported,
-                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
+                vision=vision,
                 reasoning_effort=reasoning_policy.default_effort,
                 reasoning_effort_levels=(
                     tuple(reasoning_policy.effort_levels)
@@ -14784,7 +15087,7 @@ def cmd_integrate_public(args: Any) -> int:
                 model_name=f"MTPLX {model_id}",
                 api_key=getattr(args, "api_key", None),
                 enable_thinking=reasoning_policy.supported,
-                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
+                vision=vision,
                 reasoning_effort=reasoning_policy.default_effort,
                 reasoning_effort_levels=(
                     tuple(reasoning_policy.effort_levels)
@@ -15603,6 +15906,16 @@ def cmd_config_public(args: Any) -> int:
     # that gets past here is written verbatim and re-read on every later
     # command, so a traceback here would also mean a config file the rest of
     # the CLI has to degrade around.
+    if key == "model_dirs":
+        try:
+            parsed_model_dirs = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("model_dirs must be a JSON array of directory paths") from exc
+        if not isinstance(parsed_model_dirs, list) or not all(
+            isinstance(item, str) and item.strip() for item in parsed_model_dirs
+        ):
+            raise SystemExit("model_dirs must be a JSON array of directory paths")
+        value = tuple(item.strip() for item in parsed_model_dirs)
     if key == "profile":
         try:
             value = resolve_profile_name(value)
@@ -15868,7 +16181,10 @@ def cmd_debug_public(args: Any) -> int:
 
     doctor = {
         "environment": env,
-        "huggingface": hf_cache_report(cache_dir=doctor_args.model_cache),
+        "huggingface": hf_cache_report(
+            cache_dir=doctor_args.model_cache,
+            search_dirs=getattr(doctor_args, "model_search_dirs", None),
+        ),
         "thermal_control": detect_thermal_control(),
         "tools": {
             "python": sys.executable,

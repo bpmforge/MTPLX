@@ -30,6 +30,21 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_accepts_ordered_retrieval_model_roots():
+    args = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--retrieval-model-root",
+            "/models/archive",
+            "--retrieval-model-root",
+            "/models/external",
+        ]
+    )
+
+    assert args.retrieval_model_roots == ["/models/archive", "/models/external"]
+
+
 def test_direct_server_parser_exposes_mtp_batch_numerics():
     args = parse_args(["--mtp-batch-numerics", "b1-exact", "--warmup-tokens", "0"])
 
@@ -996,6 +1011,43 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
     assert "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS" not in dark
     assert "MTPLX_BATCH_TARGET_ARRAYS" not in dark
     assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in dark
+
+
+@pytest.mark.parametrize("client", ["chat", "opencode", "pi", "hermes"])
+@pytest.mark.parametrize("flash_next", [True, False])
+def test_client_launch_defaults_preserve_model_distribution_policy(
+    tmp_path, monkeypatch, client, flash_next
+):
+    """A client preset is not an operator override of the model's fast path."""
+    from mtplx.commands.public import (
+        _apply_hermes_memory_env_defaults,
+        _apply_opencode_memory_env_defaults,
+        _apply_pi_history_budget_env_defaults,
+    )
+    from mtplx.profiles import apply_profile_env
+
+    for key in tuple(os.environ):
+        if key.startswith("MTPLX_"):
+            monkeypatch.delenv(key)
+    config = _flash_next_fixed_m4_config() if flash_next else {"model_type": "qwen3_next"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    launch_env = {}
+    if client != "chat":
+        {
+            "opencode": _apply_opencode_memory_env_defaults,
+            "pi": _apply_pi_history_budget_env_defaults,
+            "hermes": _apply_hermes_memory_env_defaults,
+        }[client](launch_env)
+    for key, value in launch_env.items():
+        monkeypatch.setenv(key, value)
+    args = SimpleNamespace(generation_mode="mtp", verify_strategy="batched", model=str(tmp_path))
+    overrides = openai._server_runtime_env_overrides(args, {})
+    apply_profile_env("turbo", environ=launch_env, runtime_env_overrides=overrides)
+    assert launch_env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == ("0" if flash_next else "1")
+    assert launch_env["MTPLX_BATCH_TARGET_ARRAYS"] == ("1" if flash_next else "0")
+    # Removing the lazy-distribution pin alone activates this dormant
+    # launcher pin, shortens D3 to three verify rows and bypasses fixed M4.
+    assert "MTPLX_LAZY_BONUS_VERIFY" not in launch_env
 
 
 def _flash_next_fixed_m4_config() -> dict:
@@ -4160,6 +4212,128 @@ class CaptureTokenizer:
 
     def decode(self, tokens, **_kwargs):
         return "".join(chr(int(token)) for token in tokens)
+
+
+class JSONToolPrefixTokenizer(CaptureTokenizer):
+    """Like native Qwen templates, render tools in incoming JSON key order."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        text = json.dumps(kwargs.get("tools") or [], ensure_ascii=False) + "\n"
+        text += "\n".join(
+            f"{message['role']}:{message.get('content') or ''}"
+            for message in messages
+        )
+        if kwargs.get("add_generation_prompt"):
+            text += "\nassistant:"
+        return self.encode(text) if kwargs.get("tokenize", True) else text
+
+
+def test_tool_schema_object_order_does_not_change_rendered_prefix(monkeypatch):
+    monkeypatch.setenv("MTPLX_CHAT_ENCODE_CACHE", "off")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Query"}},
+                "required": ["query"],
+            },
+        },
+    }
+
+    def reverse_objects(value):
+        if isinstance(value, dict):
+            return {key: reverse_objects(item) for key, item in reversed(value.items())}
+        if isinstance(value, list):
+            return [reverse_objects(item) for item in value]
+        return value
+
+    prefixes = []
+    for index, spec in enumerate((tool, reverse_objects(tool))):
+        normalized = openai._normalize_tool_specs([spec])
+        assert normalized == [tool]  # No schema fields or values disappear.
+        ids = openai._encode_messages(
+            JSONToolPrefixTokenizer(),
+            [openai.ChatMessage(role="user", content=f"Turn {index}")],
+            enable_thinking=False,
+            tool_prompt_mode="native",
+            tools=normalized,
+        )
+        prefixes.append("".join(map(chr, ids)).split("\n", 1)[0])
+    assert prefixes[0] == prefixes[1]
+
+
+@pytest.mark.parametrize("after_tool", [False, True])
+def test_disabled_tool_turn_contract_is_not_saved_as_client_history(after_tool):
+    messages = [openai.ChatMessage(role="user", content="Explain the result.")]
+    if after_tool:
+        messages += [
+            openai.ChatMessage(role="assistant", content="", tool_calls=[{
+                "id": "lookup-1", "type": "function", "function": {
+                    "name": "session_status", "arguments": "{}",
+                },
+            }]),
+            openai.ChatMessage(role="tool", tool_call_id="lookup-1", content="7"),
+        ]
+    request = openai.ChatCompletionRequest(
+        messages=messages, tools=[_tool_schema()], tool_choice="none"
+    )
+    policy = openai.resolve_request_policy(
+        _fake_state(), request, headers={"x-mtplx-client": "mtplx_app"}, metadata={}
+    )
+    assert len(policy.messages_for_generation) == len(messages) + 1
+    assert "MTPLX " in policy.messages_for_generation[-1].content
+    # The client echoes its own messages, not our request-only instruction.
+    # Banking the suffix as history made a 2,820-token answer replay on the
+    # next native chat turn, despite a successfully stored final snapshot.
+    assert policy.raw_messages_for_postcommit == messages
+    assert policy.prompt_tool_specs == policy.postcommit_tool_specs
+
+
+@pytest.mark.parametrize("client_hint", ["mtplx_app", "opencode", "pi", "hermes"])
+def test_tool_choice_none_keeps_cached_schema_but_disables_calls(monkeypatch, client_hint):
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = JSONToolPrefixTokenizer()
+    state.args.stats_footer = False
+    captured = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured.append((list(prompt_ids), kwargs["session_policy_fingerprint"]))
+        return _fake_generation("The result is available.")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+    messages = [
+        {"role": "user", "content": "Look up the current value."},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "lookup-1", "type": "function", "function": {
+                "name": "session_status", "arguments": "{}",
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "lookup-1", "content": "The value is 7."},
+    ]
+    for choice in ("auto", "none"):
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+            json={"messages": messages, "tools": [_tool_schema()], "tool_choice": choice},
+        )
+        assert response.status_code == 200
+        if choice == "none":
+            assert not response.json()["choices"][0]["message"].get("tool_calls")
+    prompts = ["".join(map(chr, ids)) for ids, _fingerprint in captured]
+    assert prompts[0].split("\n", 1)[0] == prompts[1].split("\n", 1)[0]
+    # OpenCode's compact lane puts the tool name in its stable digest;
+    # native/hybrid lanes carry the full JSON schema prefix.
+    assert "session_status" in prompts[1]
+    assert captured[0][1] == captured[1][1]
+    assert "MTPLX post-tool answer turn:" in prompts[1]
 
 
 class StepTemplateIgnoringThinkingTokenizer(CaptureTokenizer):
@@ -9075,10 +9249,10 @@ def test_chat_tools_add_no_tool_contract_when_non_chitchat_disables_tools(monkey
     )
 
     assert response.status_code == 200
-    messages, kwargs = state.runtime.tokenizer.calls[0]
+    messages, _kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX direct reply turn:" in rendered
     assert "Start with the final user-facing answer" in rendered
     assert stats["no_tools_contract_active"] is True
@@ -9158,7 +9332,8 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
     messages, kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["web_search"]
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX post-tool answer turn:" in rendered
     assert "Match the depth the user asked for" in rendered
     # The model must be anchored to today and told fresher tool results
@@ -12479,7 +12654,7 @@ def test_chat_stream_missing_required_tool_argument_still_emits_model_tool_call(
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12530,7 +12705,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 
     monkeypatch.setattr(openai, "apply_profile_env", capture_apply_profile_env)
     monkeypatch.setattr(openai, "profile_env_status", capture_profile_env_status)
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -12582,7 +12757,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 def _monkeypatch_server_state_load(monkeypatch):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12660,7 +12835,7 @@ def test_server_state_keeps_kv_quant_for_supported_family(monkeypatch):
 def test_server_state_reports_model_load_failure(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12687,7 +12862,7 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     captured = {}
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -13982,7 +14157,7 @@ def _memory_plan_state_harness(monkeypatch):
     monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -14112,3 +14287,31 @@ def test_warmup_rows_stay_out_of_dashboard_metrics_ring():
         state, {"request_id": "warm-2", "warmup": True, "completion_tokens": 8}
     )
     assert state.last_metrics[-1]["request_id"] == "real-1"
+
+
+def test_fast_path_env_status_treats_runtime_overrides_as_the_expectation(monkeypatch):
+    """Flash-Next pins MTPLX_SKIP_VERIFY_SNAPSHOT=0 and the batched target
+    distributions on purpose; /health must report those keys as ok against
+    the override the server resolved, not against the profile block."""
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0")
+
+    plain = openai._fast_path_env_status()
+    assert plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]["ok"] is False
+    assert "source" not in plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]
+
+    overrides = {
+        "MTPLX_SKIP_VERIFY_SNAPSHOT": "0",
+        "MTPLX_BATCH_TARGET_ARRAYS": "1",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "0",
+    }
+    resolved = openai._fast_path_env_status(runtime_env_overrides=overrides)
+    for key, value in overrides.items():
+        assert resolved[key]["ok"] is True, key
+        assert resolved[key]["expected"] == value
+        assert resolved[key]["source"] == "runtime_override"
+        assert resolved[key]["profile_expected"] == openai.FAST_PATH_ENV[key]
+    # keys the server did not override keep the profile expectation
+    assert "source" not in resolved["MTPLX_LAZY_VERIFY_LOGITS"]
+    assert resolved["MTPLX_LAZY_VERIFY_LOGITS"]["expected"] == openai.FAST_PATH_ENV["MTPLX_LAZY_VERIFY_LOGITS"]

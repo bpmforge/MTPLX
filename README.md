@@ -42,6 +42,29 @@ with 32 GB or more; on M1 and M2 the app and CLI pick its FP16 build (same
 weights, native precision for those chips) automatically. Both check your Mac
 before recommending anything.
 
+## Models and recommended settings
+
+Every model here is an official MTPLX pack on Hugging Face under [Youssofal](https://huggingface.co/Youssofal). "Fits" is the memory the pack actually peaks at while serving, next to the smallest Mac the app and CLI will offer it on. The preset column is what MTPLX resolves by itself, so this table is what you get by doing nothing.
+
+| Model (`Youssofal/...`) | Fits | What it is for | Preset |
+|---|---|---|---|
+| `Qwen3.5-4B-MTPLX-Optimized-Speed` | 8 GB and up, peaks at 2.9 GiB | 4-bit. The fastest fit for smaller Macs. | Sustained, depth 3 |
+| `Qwen3.5-4B-MTPLX-Optimized-Quality` | 8 GB and up, peaks at 4.8 GiB | 8-bit. The highest-fidelity 4B. | Sustained, depth 3 |
+| `Qwen3.5-9B-MTPLX-Optimized-Speed` | 16 GB and up, peaks at 10.0 GiB | 6-bit. The strong small-Mac speed pick. | Turbo. Tuning this one on a 16 GB M4 Mac mini lands on depth 1 |
+| `Qwen3.8-27B-MTPLX-Bare-Speed` | 32 GB and up, peaks at 20.0 GiB | Quickest burst chat speeds. Lower quality and slower on long coding tasks. | Turbo, depth 3 |
+| `Qwen3.8-27B-MTPLX-Optimized-Speed` | 32 GB and up, peaks at 25.0 GiB | 4-bit dynamic quant. Great coding speeds and good quality. The recommended coding model. | Turbo, depth 3 |
+| `Qwen3.8-27B-MTPLX-Optimized-Quality` | 36 GB and up, peaks at 33.0 GiB | 8-bit dynamic quant. Good coding speeds and perfect quality. | Turbo, depth 3 |
+| `Qwen3.8-27B-MTPLX-Bare-Speed-FP16` | 32 GB and up, peaks at 20.0 GiB | The Bare Speed pack for M1 and M2: same weights, every 16-bit tensor cast to fp16. | Turbo, depth 3 |
+| `Qwen3.8-27B-MTPLX-Optimized-Speed-FP16` | 32 GB and up, peaks at 25.0 GiB | The recommended coding model for M1 and M2. | Turbo, depth 3 |
+| `Qwen3.8-27B-MTPLX-Optimized-Quality-FP16` | 36 GB and up, peaks at 33.0 GiB | The Optimized Quality pack for M1 and M2. | Turbo, depth 3 |
+| `Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` | 96 GB and up, peaks at 87 GiB resident | The 125B MoE preview, dynamic 4-bit with 8-bit attention. Its 32 GB n-gram table streams from SSD instead of taking RAM. | Turbo, depth 3. This family accepts up to depth 5 |
+| `Gemma4-MTPLX-Optimized-Speed` | 32 GB and up, peaks at 18.0 GiB | High quality, moderate speeds. Runs as an assistant pair, so the tuned control is the draft block size rather than depth. | Sustained |
+| **What the author runs** | M5 Max, 128 GB | Flash-Next Optimized Speed, for everything | Turbo, depth 3 |
+
+Depth 3 is the launch default. `mtplx tune --retune` measures autoregressive decoding against each depth on your own Mac and saves a shallower one when a shallower one wins, which is why the 9B row above is depth 1 on a Mac mini. M1 and M2 Macs are offered the FP16 builds and every other Mac the bf16 parents, so you never pick the precision by hand. The "fits" numbers are peak serving memory, not download size, and they are the same numbers MTPLX checks your Mac against before it offers you anything.
+
+Qwen 3.6 is still published and still supported: 27B in speed and quality builds, and the 35B MoE in speed and balance builds. The 3.8 packs above replaced it as the default recommendation, and the app and CLI still list the 3.6 packs below them.
+
 ## The app
 
 <img src="docs/assets/readme/app-dashboard.jpg" alt="MTPLX dashboard with live decode gauge" width="100%" />
@@ -51,6 +74,28 @@ The dashboard shows what your model is doing while it does it: live tokens per s
 <img src="docs/assets/readme/app-chat.jpg" alt="Chat streaming with live speed badge" width="100%" />
 
 Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
+
+### Model libraries
+
+You can keep every model in one folder or configure several ordered folders in
+Settings under Model libraries. The primary folder receives downloads and
+Forge output. Additional folders are discovery roots, so external drives and
+existing collections stay in place. MTPLX remembers unavailable volumes and
+uses the first complete copy it finds in folder order.
+
+The CLI uses the same primary plus additional-root policy:
+
+```toml
+# ~/.mtplx/config.toml
+model_dir = "/Volumes/Models/MTPLX"
+model_dirs = ["/Volumes/Model Archive", "/Users/me/Models"]
+```
+
+`model_dir` is the writable primary root. `model_dirs` are ordered discovery
+roots. You can also repeat `--model-search-dir` on supported commands or set
+`MTPLX_MODEL_DIRS` to a colon-separated path list on macOS and Linux. Pulls and
+Forge builds always write to the primary root. CLI updates and removals in an
+additional root require selecting that root explicitly with `--cache-dir`.
 
 ## Auto-tune
 
@@ -74,7 +119,7 @@ The official catalog lives on Hugging Face under [Youssofal](https://huggingface
 
 ## The server
 
-`mtplx start` (or the app's play button) serves an OpenAI-compatible API on `127.0.0.1:8000`: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, the optional `/v1/embeddings` and `/v1/rerank` (see below), plus an Anthropic-compatible `/v1/messages` with streaming, tool calls in both styles, `/health`, and `/metrics`. Claude Code, Cline, Continue, Open WebUI, curl, the openai and anthropic Python clients: if it speaks the API, it works. The app and CLI share one server, so `mtplx start` attaches to the app's running model instead of loading a second copy.
+`mtplx start` (or the app's play button) serves an OpenAI-compatible API on `127.0.0.1:8000`: `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/models`, and the optional `/v1/embeddings` and `/v1/rerank` (see below), plus an Anthropic-compatible `/v1/messages` with streaming, tool calls in both styles, `/health`, and `/metrics`. The stateless, text-only Responses route provides Codex Responses compatibility with hosted tools disabled: it supports client-executed function/custom tools and namespace-grouped functions. Codex 0.146 sends `web_search` by default, and MTPLX intentionally returns a precise `400` for that request unless the hosted tool is disabled or removed. Codex may send `reasoning.effort: "xhigh"`; MTPLX resolves it against the loaded model. Qwen 3.8 preserves `xhigh`, Step 3.5 clamps it to `high`, and Qwen 3.6 exposes no reasoning-effort tier. Request observability records the requested and effective values plus whether the request was downgraded. Claude Code, Cline, Continue, Open WebUI, curl, the openai and anthropic Python clients: if it speaks the API, it works; the Responses hosted-tool limitation above still applies. The app and CLI share one server, so `mtplx start` attaches to the app's running model instead of loading a second copy.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \

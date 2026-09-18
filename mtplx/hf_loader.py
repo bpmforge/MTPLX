@@ -12,7 +12,7 @@ import re
 import shutil
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Iterable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
@@ -295,6 +295,74 @@ def model_cache_dir(value: str | Path | None = None) -> Path:
     return DEFAULT_MODEL_CACHE
 
 
+def model_library_roots(
+    cache_dir: str | Path | None = None,
+    *,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> tuple[Path, ...]:
+    """Ordered, canonical model roots with the writable cache first.
+
+    ``cache_dir`` retains the existing explicit/config/``MTPLX_MODEL_DIR``
+    primary-root contract. Additional roots are discovery-only and come from
+    the caller followed by the platform path-list in ``MTPLX_MODEL_DIRS``.
+    """
+
+    if isinstance(search_dirs, (str, Path)):
+        caller_dirs: Iterable[str | Path] = (search_dirs,)
+    else:
+        caller_dirs = search_dirs or ()
+    env_dirs = os.environ.get("MTPLX_MODEL_DIRS", "").split(os.pathsep)
+    candidates: Iterable[str | Path] = (
+        model_cache_dir(cache_dir),
+        *caller_dirs,
+        *(entry for entry in env_dirs if entry.strip()),
+    )
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = str(candidate).strip()
+        if not text:
+            continue
+        root = Path(text).expanduser().resolve(strict=False)
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+    return tuple(roots)
+
+
+def ensure_model_root(root: str | Path) -> Path:
+    """Create the writable model root, naming the real problem when it cannot be.
+
+    A library kept on an external drive that is not connected resolves to a
+    path under ``/Volumes`` that no user process may create, and a read-only
+    location fails the same way. The bare ``PermissionError`` names whichever
+    parent refused, not the setting the user has to change, so downloads and
+    Forge builds say which model directory is unavailable and why.
+    """
+
+    path = Path(root).expanduser()
+    if path.is_symlink() and not path.exists():
+        # The #466 layout: ~/.mtplx/models is a symlink onto an external
+        # drive. Unplugged, mkdir raises FileExistsError for the link itself.
+        raise RuntimeError(
+            f"model directory {path} is not available: it links to "
+            f"{os.readlink(path)}, whose volume is not mounted. Reconnect the "
+            "drive or choose another model directory."
+        )
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"model directory {path} is not available: its volume is not "
+            f"mounted or the location is not writable ({exc.strerror}: "
+            f"{exc.filename}). Reconnect the drive or choose another model "
+            "directory."
+        ) from exc
+    return path
+
+
 def safe_model_name(repo_id: str) -> str:
     return repo_id.strip("/").replace("/", "--")
 
@@ -565,25 +633,63 @@ def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
     return True
 
 
-def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -> Path:
+def huggingface_cache_path(repo_id: str) -> Path | None:
+    """Locate ``repo_id`` in the shared Hugging Face cache, or return ``None``.
+
+    ``snapshot_download(local_files_only=True)`` is the hub's own local
+    lookup, so it honours HF_HOME, HF_HUB_CACHE and HF_HUB_OFFLINE exactly the
+    way every other Hugging Face tool on the machine does, resolves the ref to
+    the right snapshot directory, and raises when the repo is not cached. It
+    never touches the network. A user who already downloaded a model with
+    `hf download`, mlx-lm, or transformers should not have to download the
+    same bytes a second time into MTPLX's private cache.
+    """
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        # An install without huggingface_hub (or one too old for this call)
+        # keeps resolving exactly as it did before this step existed.
+        return None
+    try:
+        resolved = Path(snapshot_download(repo_id, local_files_only=True))
+    except Exception:
+        # Not cached, or the hub refused the lookup. Either way the caller
+        # falls through to the download hint.
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def resolve_model_path(
+    model_ref: str,
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> Path:
     local = Path(model_ref).expanduser()
     if local.exists():
         return local
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
         raise FileNotFoundError(f"Model path is not available locally: {local}")
-    cached = cached_model_path(repo_id, cache_dir=cache_dir)
-    if _cached_model_ready_for_repo(cached, repo_id):
-        return cached
-    # Branded local builds (forge output, `mtplx models` rows) live under the
-    # bare repo basename, not the Org--Name snapshot layout. Bench's default
-    # model selection already resolves them for the same id ("installed
-    # locally"); quickstart/serve must agree, or the CLI tells a user to
-    # re-download 20 GB it already lists. Same contract gate as above.
-    if "/" in repo_id:
-        branded = cached.parent / repo_id.split("/", 1)[1]
-        if branded != cached and _cached_model_ready_for_repo(branded, repo_id):
-            return branded
+    for root in model_library_roots(cache_dir, search_dirs=search_dirs):
+        cached = root / safe_model_name(repo_id)
+        if _cached_model_ready_for_repo(cached, repo_id):
+            return cached
+        # Branded local builds (forge output, `mtplx models` rows) live under
+        # the bare repo basename. Root precedence wins over layout preference:
+        # return the first complete copy from the ordered library list.
+        if "/" in repo_id:
+            branded = root / repo_id.split("/", 1)[1]
+            if branded != cached and _cached_model_ready_for_repo(branded, repo_id):
+                return branded
+    # Last local step before the download hint: the machine-wide Hugging Face
+    # cache. MTPLX's own library roots stay first so existing installs resolve
+    # where they always did, and the shared snapshot is held to the same
+    # contract gate, so a half-downloaded copy is skipped rather than served.
+    shared = huggingface_cache_path(repo_id)
+    if shared is not None and _cached_model_ready_for_repo(shared, repo_id):
+        return shared
     raise FileNotFoundError(
         f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
     )
@@ -926,11 +1032,34 @@ def _classify_pull_error(exc: BaseException, repo_id: str) -> str:
 
 
 def _safe_destination_for_repo_file(destination: Path, repo_file: RepoFile) -> Path:
-    target = destination / repo_file.path
+    raw = str(repo_file.path)
+    posix = PurePosixPath(raw)
+    windows = PureWindowsPath(raw)
+    if (
+        not raw.strip()
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or ".." in posix.parts
+        or ".." in windows.parts
+    ):
+        raise RuntimeError(f"unsafe file path in Hugging Face repo: {repo_file.path}")
+    target = destination.joinpath(*posix.parts)
+    if destination.is_symlink():
+        raise RuntimeError(f"unsafe model destination symlink: {destination}")
+    canonical_destination = destination.resolve(strict=False)
+    cursor = destination
+    for part in posix.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise RuntimeError(
+                f"unsafe symlink component in Hugging Face repo path: {repo_file.path}"
+            )
     try:
-        target.relative_to(destination)
+        target.parent.resolve(strict=False).relative_to(canonical_destination)
     except ValueError as exc:
-        raise RuntimeError(f"unsafe file path in Hugging Face repo: {repo_file.path}") from exc
+        raise RuntimeError(
+            f"unsafe file path in Hugging Face repo: {repo_file.path}"
+        ) from exc
     return target
 
 
@@ -1121,6 +1250,144 @@ def _download_repo_file(
     )
 
 
+def _resolve_download_backend(requested: str) -> tuple[str, str | None]:
+    backend = requested.strip().lower()
+    if backend not in {"auto", "python", "aria2"}:
+        raise ValueError(
+            "download backend must be one of: auto, python, aria2"
+        )
+    aria2c = shutil.which("aria2c")
+    if backend == "python":
+        return "python", None
+    if aria2c:
+        return "aria2", aria2c
+    if backend == "aria2":
+        raise RuntimeError(
+            "aria2 download backend requested, but aria2c is not installed. "
+            "Install it with `brew install aria2` or use --download-backend python."
+        )
+    return "python", None
+
+
+def _download_repo_files_with_aria2(
+    repo_files: list[RepoFile],
+    *,
+    executable: str,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    token: str | bool | None,
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int]:
+    from mtplx.aria2_downloader import Aria2Download, run_aria2_downloads
+
+    headers = tuple(
+        f"{name}: {value}" for name, value in build_hf_headers(token=token).items()
+    )
+    downloads: list[Aria2Download] = []
+    settled_bytes = 0
+    for repo_file in repo_files:
+        target = _safe_destination_for_repo_file(destination, repo_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        expected_size = repo_file.size_bytes
+        if expected_size is not None and target.exists() and target.stat().st_size == expected_size:
+            settled_bytes += expected_size
+            continue
+        if expected_size is None and target.exists() and target.stat().st_size > 0:
+            settled_bytes += target.stat().st_size
+            continue
+
+        partial = target.with_name(target.name + ".incomplete")
+        if target.exists():
+            target.unlink()
+        if (
+            expected_size is not None
+            and partial.exists()
+            and partial.stat().st_size > expected_size
+        ):
+            partial.unlink()
+        downloads.append(
+            Aria2Download(
+                url=hf_hub_url(
+                    repo_id=repo_id,
+                    filename=repo_file.path,
+                    revision=revision,
+                ),
+                output=partial,
+                headers=headers,
+                expected_size=expected_size,
+                sha256=repo_file.sha256,
+                display_name=repo_file.path,
+            )
+        )
+
+    def report(completed: int, rate_bps: float, file_path: str | None) -> None:
+        nonlocal last_emit_at, last_emit_size
+        now = time.monotonic()
+        current_size = settled_bytes + completed
+        interval = max(0.001, now - last_emit_at)
+        reported_size = min(current_size, total_bytes) if total_bytes else current_size
+        _emit_download_progress(
+            callback,
+            {
+                "event": "progress",
+                "repo_id": repo_id,
+                "path": str(destination),
+                "file": file_path,
+                "size_bytes": reported_size,
+                "total_bytes": total_bytes,
+                "delta_bytes": current_size - last_emit_size,
+                "rate_bps": max(0.0, rate_bps),
+                "elapsed_s": now - started_at,
+                "interval_s": interval,
+                "stalled_s": 0,
+                "message": "Downloading model files with aria2c",
+            },
+        )
+        last_emit_at = now
+        last_emit_size = current_size
+
+    run_aria2_downloads(
+        downloads,
+        executable=executable,
+        progress_callback=report if callback is not None else None,
+        progress_interval_s=progress_interval_s,
+    )
+    for download in downloads:
+        partial = download.output
+        if not partial.is_file():
+            raise RuntimeError(
+                f"aria2c did not produce a completed file for {download.display_name}"
+            )
+        if (
+            download.expected_size is not None
+            and partial.stat().st_size != download.expected_size
+        ):
+            raise RuntimeError(
+                f"incomplete download for {download.display_name}: expected "
+                f"{download.expected_size} bytes, got {partial.stat().st_size}"
+            )
+        target = partial.with_name(partial.name.removesuffix(".incomplete"))
+        partial.replace(target)
+    return _emit_current_download_size(
+        callback,
+        repo_id=repo_id,
+        destination=destination,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        last_emit_at=last_emit_at,
+        last_emit_size=last_emit_size,
+        measure=lambda: manifest_bytes_on_disk(destination, repo_files),
+    )
+
+
 def _download_snapshot_with_structured_progress(
     *,
     repo_id: str,
@@ -1128,6 +1395,8 @@ def _download_snapshot_with_structured_progress(
     destination: Path,
     progress_callback: DownloadProgressCallback | None,
     progress_interval_s: float,
+    download_backend: str = "python",
+    aria2c_path: str | None = None,
 ) -> tuple[Path, int | None]:
     HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
     try:
@@ -1173,6 +1442,30 @@ def _download_snapshot_with_structured_progress(
     started_at = time.monotonic()
     last_emit_at = started_at
     last_emit_size = measure()
+    if download_backend == "aria2":
+        if not aria2c_path:
+            raise RuntimeError("aria2 download backend has no aria2c executable")
+        try:
+            _download_repo_files_with_aria2(
+                repo_files,
+                executable=aria2c_path,
+                repo_id=repo_id,
+                revision=revision,
+                destination=destination,
+                hf_hub_url=hf_hub_url,
+                build_hf_headers=build_hf_headers,
+                token=token,
+                callback=progress_callback,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                progress_interval_s=max(0.1, progress_interval_s),
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+        return destination, total_bytes
+
     for repo_file in repo_files:
         try:
             last_emit_at, last_emit_size = _download_repo_file(
@@ -1206,6 +1499,9 @@ class CachedModel:
     has_runtime_contract: bool
     has_config: bool
     validation: dict[str, Any]
+    root: Path | None = None
+    root_index: int = 0
+    is_primary: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         # Per-model launch resolution promotes the quantized flagships to
@@ -1222,6 +1518,9 @@ class CachedModel:
             "has_runtime_contract": self.has_runtime_contract,
             "has_config": self.has_config,
             "validation": self.validation,
+            "root": str(self.root or self.path.parent),
+            "root_index": self.root_index,
+            "is_primary": self.is_primary,
             "recommended_profile": (
                 resolved_default_profile_name_for_ref(self.path)
                 if self.validation.get("ok")
@@ -1231,25 +1530,39 @@ class CachedModel:
         }
 
 
-def list_cached_models(*, cache_dir: str | Path | None = None) -> list[CachedModel]:
-    root = model_cache_dir(cache_dir)
-    if not root.exists():
-        return []
+def list_cached_models(
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> list[CachedModel]:
     rows: list[CachedModel] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+    seen: set[str] = set()
+    for root_index, root in enumerate(
+        model_library_roots(cache_dir, search_dirs=search_dirs)
+    ):
+        if not root.is_dir():
             continue
-        repo_id = child.name.replace("--", "/")
-        rows.append(
-            CachedModel(
-                repo_id=repo_id,
-                path=child,
-                size_bytes=directory_size_bytes(child),
-                has_runtime_contract=(child / "mtplx_runtime.json").exists(),
-                has_config=(child / "config.json").exists(),
-                validation=validate_mtplx_model_files(child),
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            identity = os.path.normcase(str(child.resolve(strict=False)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            repo_id = child.name.replace("--", "/")
+            rows.append(
+                CachedModel(
+                    repo_id=repo_id,
+                    path=child,
+                    size_bytes=directory_size_bytes(child),
+                    has_runtime_contract=(child / "mtplx_runtime.json").exists(),
+                    has_config=(child / "config.json").exists(),
+                    validation=validate_mtplx_model_files(child),
+                    root=root,
+                    root_index=root_index,
+                    is_primary=root_index == 0,
+                )
             )
-        )
     return rows
 
 
@@ -1295,15 +1608,22 @@ def pull_model(
     progress_interval_s: float = 10.0,
     force_sync: bool = False,
     destination: Path | None = None,
+    download_backend: str = "python",
 ) -> dict[str, Any]:
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
         raise ValueError(f"pull requires a Hugging Face repo id or URL, got: {model_ref}")
     revision = _effective_model_revision(repo_id, revision)
-    root = model_cache_dir(cache_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    root = ensure_model_root(model_cache_dir(cache_dir).expanduser().absolute())
     if destination is None:
         destination = cached_model_path(repo_id, cache_dir=root)
+    destination = Path(destination).expanduser().absolute()
+    if destination.parent.resolve() != root.resolve():
+        raise ValueError(f"pull destination must be a direct child of {root}")
+    if destination.is_symlink():
+        raise RuntimeError(
+            f"refusing to write model through top-level symlink: {destination}"
+        )
 
     started_size = directory_size_bytes(destination)
     started_disk_bytes = started_size
@@ -1381,6 +1701,7 @@ def pull_model(
         )
     else:
         reused_existing = False
+        selected_backend, aria2c_path = _resolve_download_backend(download_backend)
         # Pin the whole download to one resolved commit so every file comes
         # from the same snapshot even if the repo is pushed to mid-download.
         _resolve_remote_snapshot()
@@ -1410,6 +1731,11 @@ def pull_model(
             total_bytes = _query_repo_total_bytes(repo_id, revision=download_revision)
         else:
             total_bytes = None
+        for name, entry in (remote_files or {}).items():
+            _safe_destination_for_repo_file(
+                destination,
+                RepoFile(path=name, size_bytes=entry.get("size")),
+            )
         _require_download_disk_headroom(
             root,
             total_bytes=total_bytes,
@@ -1442,13 +1768,15 @@ def pull_model(
             else contextlib.nullcontext()
         )
         with progress_suppression:
-            if progress_callback is not None:
+            if progress_callback is not None or selected_backend == "aria2":
                 resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
                     revision=download_revision,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
+                    download_backend=selected_backend,
+                    aria2c_path=aria2c_path,
                 )
                 if total_bytes_from_download:
                     total_bytes = total_bytes_from_download
@@ -1542,45 +1870,109 @@ def pull_model(
 
 
 def resolve_cached_model_target(
-    model_ref: str, *, cache_dir: str | Path | None = None
+    model_ref: str,
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
 ) -> tuple[str, Path]:
-    """Resolve a model ref to the cached directory it is allowed to delete.
+    """Resolve one unambiguous, primary-root cache entry without deleting it."""
 
-    Containment fence for destructive cache operations. ``safe_model_name``
-    only swaps "/" for "--", so refs like ".", "..", "/", and "" collapse onto
-    the models cache itself or its parent (~/.mtplx — bin, config.toml,
-    session-bank, logs); an unguarded ``rmtree`` took the lot and still exited
-    0. A legitimate ref always resolves to a direct child of the models cache.
-    Raises ValueError for anything else, so callers refuse rather than delete.
-    """
-
-    repo_id = repo_id_from_model_ref(model_ref) or model_ref.replace("--", "/")
-    root = model_cache_dir(cache_dir).resolve()
-    path = cached_model_path(repo_id, cache_dir=cache_dir).resolve()
-    if path.parent != root or path.name in {"", ".", ".."}:
+    raw_ref = str(model_ref).strip()
+    repo_id = repo_id_from_model_ref(raw_ref)
+    if repo_id is None:
+        # Not a Hugging Face id: only a cached directory name ("Org--Name" or
+        # a bare branded name) is accepted. Anything carrying a path
+        # separator is refused outright, so no traversal spelling needs to
+        # be reasoned about individually.
+        if not raw_ref or "/" in raw_ref or "\\" in raw_ref:
+            raise ValueError(
+                f"refusing to remove model ref {model_ref!r}: "
+                "invalid cached model reference"
+            )
+        repo_id = raw_ref.replace("--", "/")
+    if any(not segment or segment in {".", ".."} for segment in repo_id.split("/")):
         raise ValueError(
-            f"refusing to remove {path}: model ref {model_ref!r} does not name "
-            f"a model directory inside {root}"
+            f"refusing to remove model ref {model_ref!r}: "
+            "invalid cached model reference"
+        )
+
+    roots = model_library_roots(cache_dir, search_dirs=search_dirs)
+    matches: list[tuple[int, Path]] = []
+    seen: set[str] = set()
+    for root_index, root in enumerate(roots):
+        names = [safe_model_name(repo_id)]
+        if "/" in repo_id:
+            names.append(repo_id.split("/", 1)[1])
+        for name in names:
+            path = root / name
+            if path == root or path.parent.resolve() != root.resolve():
+                raise ValueError(
+                    f"refusing to remove {path}: model ref {model_ref!r} does "
+                    f"not name a model directory inside {root}"
+                )
+            key = os.path.normcase(str(path.absolute()))
+            if key in seen or not (path.exists() or path.is_symlink()):
+                continue
+            seen.add(key)
+            matches.append((root_index, path))
+
+    default_path = roots[0] / safe_model_name(repo_id)
+    if len(matches) > 1:
+        paths = ", ".join(str(path) for _, path in matches)
+        raise ValueError(
+            f"multiple installed copies match {repo_id}: {paths}; "
+            "select one root explicitly with --cache-dir"
+        )
+    if not matches:
+        return repo_id, default_path
+    root_index, path = matches[0]
+    if root_index != 0:
+        raise ValueError(
+            f"model is installed in discovery-only root {path.parent}; "
+            "select that root explicitly with --cache-dir to remove it"
         )
     return repo_id, path
 
 
-def remove_cached_model(model_ref: str, *, cache_dir: str | Path | None = None) -> dict[str, Any]:
-    repo_id, path = resolve_cached_model_target(model_ref, cache_dir=cache_dir)
-    existed = path.exists()
-    size = directory_size_bytes(path) if existed else 0
-    if existed:
+def remove_cached_model(
+    model_ref: str,
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
+    repo_id, path = resolve_cached_model_target(
+        model_ref, cache_dir=cache_dir, search_dirs=search_dirs
+    )
+    if not (path.exists() or path.is_symlink()):
+        return {
+            "repo_id": repo_id,
+            "path": str(path),
+            "removed": False,
+            "size_bytes_removed": 0,
+        }
+    if path.is_symlink():
+        size = 0
+        path.unlink()
+    elif path.is_dir():
+        size = directory_size_bytes(path)
         shutil.rmtree(path)
+    else:
+        raise ValueError(f"cached model entry is not a directory: {path}")
     return {
         "repo_id": repo_id,
         "path": str(path),
-        "removed": existed,
+        "removed": True,
         "size_bytes_removed": size,
     }
 
 
-def hf_cache_report(*, cache_dir: str | Path | None = None) -> dict[str, Any]:
+def hf_cache_report(
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
     root = model_cache_dir(cache_dir)
+    roots = model_library_roots(cache_dir, search_dirs=search_dirs)
     # The same resolver pull uses, so doctor can never report a token that
     # pull then ignores (or the other way round).
     token_source = hf_token_source()
@@ -1592,11 +1984,14 @@ def hf_cache_report(*, cache_dir: str | Path | None = None) -> dict[str, Any]:
         free_bytes = None
     return {
         "cache_dir": str(root),
+        "model_roots": [str(candidate) for candidate in roots],
         "cache_exists": root.exists(),
         "cache_writable": os.access(root if root.exists() else root.parent, os.W_OK),
         "disk_free_bytes": free_bytes,
         "disk_free_gb": round(free_bytes / 1_000_000_000, 3) if free_bytes is not None else None,
-        "cached_models": len(list_cached_models(cache_dir=root)),
+        "cached_models": len(
+            list_cached_models(cache_dir=root, search_dirs=roots[1:])
+        ),
         "token_present": token_present,
         "token_source": token_source,
         "token_used_by_pull": token_present,

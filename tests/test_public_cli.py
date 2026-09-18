@@ -605,8 +605,8 @@ def test_opencode_memory_defaults_scale_on_high_memory_darwin(monkeypatch):
     # "auto": the engine budgets half the post-model RAM surplus at startup.
     assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "auto"
     assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "auto"
-    assert env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
-    assert env["MTPLX_LAZY_BONUS_VERIFY"] == "1"
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in env
+    assert "MTPLX_LAZY_BONUS_VERIFY" not in env
     assert env["MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"] == "1"
     assert env["MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"] == "1"
     # #282: the launcher exports no read-inspection compaction battery.
@@ -629,8 +629,8 @@ def test_opencode_memory_defaults_stay_conservative_below_high_memory(monkeypatc
     assert env["MTPLX_SESSION_BANK_MAX_ENTRIES"] == "6"
     assert env["MTPLX_SESSION_BANK_MAX_BYTES"] == "auto"
     assert env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] == "auto"
-    assert env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
-    assert env["MTPLX_LAZY_BONUS_VERIFY"] == "1"
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in env
+    assert "MTPLX_LAZY_BONUS_VERIFY" not in env
     assert env["MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"] == "1"
     assert env["MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"] == "1"
     # #282: the launcher exports no read-inspection compaction battery.
@@ -1531,7 +1531,7 @@ def test_serve_dry_run_prefers_contract_draft_sampler_over_internal_defaults(
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (str(model_dir), None),
+        lambda model, cache_dir=None, search_dirs=None: (str(model_dir), None),
     )
     monkeypatch.setattr(
         public,
@@ -1591,7 +1591,7 @@ def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (str(model_dir), None),
+        lambda model, cache_dir=None, search_dirs=None: (str(model_dir), None),
     )
     monkeypatch.setattr(
         public,
@@ -1682,6 +1682,12 @@ def test_serve_forwards_retrieval_flags_to_the_server_command(
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
     model_dir = tmp_path / "example-model"
     model_dir.mkdir()
+    # Retrieval references are validated before launch now, so they have to
+    # resolve for the forwarding itself to be reachable.
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None, search_dirs=None: model_dir,
+    )
     payload = _serve_dry_run_payload_for_model(
         monkeypatch,
         capsys,
@@ -1691,12 +1697,18 @@ def test_serve_forwards_retrieval_flags_to_the_server_command(
             "org/embed=e1",
             "--reranker-model",
             "org/rank",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
             "--retrieval-trust-remote-code",
         ),
     )
     command = payload["server_command"]
     assert "--embedding-model org/embed=e1" in command
     assert "--reranker-model org/rank" in command
+    assert "--retrieval-model-root /models/archive" in command
+    assert "--retrieval-model-root /models/external" in command
     assert "--retrieval-trust-remote-code" in command
 
 
@@ -1750,6 +1762,10 @@ def test_serve_does_not_grant_remote_code_trust_by_default(
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
     model_dir = tmp_path / "example-model"
     model_dir.mkdir()
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None, search_dirs=None: model_dir,
+    )
     payload = _serve_dry_run_payload_for_model(
         monkeypatch,
         capsys,
@@ -1757,6 +1773,50 @@ def test_serve_does_not_grant_remote_code_trust_by_default(
         extra_args=("--embedding-model", "org/embed"),
     )
     assert "--retrieval-trust-remote-code" not in payload["server_command"]
+
+
+def test_serve_refuses_to_start_when_a_retrieval_model_is_missing(
+    monkeypatch, tmp_path, capsys
+):
+    """Issue #445: a missing embedder used to boot fine and 500 on first use."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    model_dir = tmp_path / "example-model"
+    model_dir.mkdir()
+
+    def missing(ref, cache_dir=None):
+        raise FileNotFoundError(f"Model {ref} is not cached. Run: mtplx pull {ref}")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", missing)
+    monkeypatch.setattr(public, "_serve_should_onboard", lambda _args: False)
+    monkeypatch.setattr(public, "_port_is_busy", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (str(model_dir), None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda runtime_model, *, unsafe_force_unverified, yes: (
+            {"compatibility": {"can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            str(model_dir),
+            "--embedding-model",
+            "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+            "--yes",
+        ]
+    )
+    args.dry_run = True
+    assert public.cmd_serve_public(args) == 1
+    output = capsys.readouterr().out
+    assert "mtplx pull mlx-community/Qwen3-Embedding-4B-4bit-DWQ" in output
+    assert "--embedding-model" in output
 
 
 def test_start_opencode_dry_run_uses_step_descriptor_defaults(
@@ -2403,7 +2463,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert args.chat_template_profile == "tokenizer"
     assert public._inspection_context_window(inspection, args=args) == 32_768
     assert payload["context_window"] == 32_768
-    assert payload["output_limit"] == 32_768
+    # Half the window: OpenCode reserves the output limit out of the context
+    # before deciding whether the conversation still fits (issue #480).
+    assert payload["output_limit"] == 16_384
     assert payload["tool_prompt_mode"] == "native"
     assert "--tool-prompt-mode native" in payload["server_command"]
     assert "--context-window 32768" in payload["server_command"]
@@ -2412,7 +2474,8 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     expanded = public._quickstart_opencode_payload(args, inspection=inspection)
 
     assert expanded["context_window"] == 65_536
-    assert expanded["output_limit"] == 32_768
+    # Capped at the 32,000 OpenCode injects on large windows.
+    assert expanded["output_limit"] == 32_000
     assert "--context-window 65536" in expanded["server_command"]
     assert "--max-response-tokens 32768" in expanded["server_command"]
 
@@ -6490,6 +6553,31 @@ def test_config_set_dry_run_uses_selected_path(tmp_path, capsys):
     assert not config.exists()
 
 
+def test_config_set_writes_model_directory_array(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+
+    code = main(
+        [
+            "config",
+            "set",
+            "model_dirs",
+            '["/models/archive", "/models/external"]',
+            "--config",
+            str(config),
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["updated"] == {
+        "model_dirs": ["/models/archive", "/models/external"]
+    }
+    assert tomllib.loads(config.read_text(encoding="utf-8"))["model_dirs"] == [
+        "/models/archive",
+        "/models/external",
+    ]
+
+
 def test_debug_hotpath_reports_next_kernel_boundary(capsys):
     code = main(["debug", "hotpath"])
 
@@ -7788,7 +7876,7 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (model, None),
+        lambda model, cache_dir=None, search_dirs=None: (model, None),
     )
     monkeypatch.setattr(
         public,
@@ -7821,7 +7909,8 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
     args = SimpleNamespace(
         command="serve",
         model="models/configured",
-        cache_dir=None,
+        cache_dir="/models/cache",
+        model_search_dirs=["/models/archive", "/models/shared"],
         download=False,
         profile="stable",
         unsafe_force_unverified=False,
@@ -7852,6 +7941,8 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
 
     assert len(invocations) == 1
     assert invocations[0]["configured_model"] == "models/configured"
+    assert invocations[0]["cache_dir"] == "/models/cache"
+    assert invocations[0]["search_dirs"] == ["/models/archive", "/models/shared"]
     assert invocations[0]["port"] == 8765
     assert args._onboarded is True
     assert args.model == "models/onboarded"
@@ -8387,12 +8478,19 @@ def test_pull_progress_json_emits_ndjson_events(tmp_path, monkeypatch, capsys):
     import mtplx.hf_loader as hf_loader
 
     def fake_pull_model(
-        model, *, cache_dir, revision, progress_callback, progress_interval_s
+        model,
+        *,
+        cache_dir,
+        revision,
+        progress_callback,
+        progress_interval_s,
+        download_backend,
     ):
         assert model == "mtplx/example"
         assert cache_dir == str(tmp_path)
         assert revision is None
         assert progress_interval_s == 0.4
+        assert download_backend == "python"
         progress_callback(
             {
                 "event": "start",
@@ -8515,7 +8613,17 @@ def test_model_cache_commands_parse():
 
     pull_args = parser.parse_args(["pull", "mtplx/example", "--revision", "main"])
     pull_progress_args = parser.parse_args(["pull", "mtplx/example", "--progress-json"])
-    list_args = parser.parse_args(["list", "--cache-dir", "/tmp/mtplx-models"])
+    list_args = parser.parse_args(
+        [
+            "list",
+            "--cache-dir",
+            "/tmp/mtplx-models",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
+        ]
+    )
     remove_args = parser.parse_args(["remove", "mtplx/example", "--missing-ok"])
 
     assert pull_args.command == "pull"
@@ -8524,8 +8632,40 @@ def test_model_cache_commands_parse():
     assert pull_progress_args.progress_json is True
     assert list_args.command == "list"
     assert list_args.cache_dir == "/tmp/mtplx-models"
+    assert list_args.model_search_dirs == ["/models/archive", "/models/external"]
     assert remove_args.command == "remove"
     assert remove_args.missing_ok is True
+
+
+def test_remove_command_reports_multi_root_ambiguity_without_deleting(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    first = primary / "owner--pack"
+    second = secondary / "owner--pack"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    code = main(
+        [
+            "remove",
+            "owner/pack",
+            "--cache-dir",
+            str(primary),
+            "--model-search-dir",
+            str(secondary),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert payload["error"] == "remove failed"
+    assert "multiple installed copies" in payload["detail"]
+    assert first.is_dir()
+    assert second.is_dir()
 
 
 def test_init_parser_exposes_model_cache_and_profile_options():
@@ -8538,6 +8678,10 @@ def test_init_parser_exposes_model_cache_and_profile_options():
             "mtplx/example",
             "--model-dir",
             "/tmp/mtplx-models",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
             "--profile",
             "exact",
             "--thermal-control",
@@ -8550,10 +8694,100 @@ def test_init_parser_exposes_model_cache_and_profile_options():
     assert args.command == "init"
     assert args.model == "mtplx/example"
     assert args.model_dir == "/tmp/mtplx-models"
+    assert args.model_search_dirs == ["/models/archive", "/models/external"]
     assert args.profile == "exact"
     assert args.thermal_control == "none"
     assert args.download is True
     assert args.write is True
+
+
+def test_init_writes_model_search_dirs_to_config(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.toml"
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+
+    code = main(
+        [
+            "init",
+            "--config",
+            str(config),
+            "--model-dir",
+            str(tmp_path / "primary"),
+            "--model-search-dir",
+            str(tmp_path / "archive"),
+            "--model-search-dir",
+            str(tmp_path / "external"),
+            "--write",
+            "--json",
+        ]
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["wrote_config"] is True
+    saved = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert saved["model_dir"] == str(tmp_path / "primary")
+    assert saved["model_dirs"] == [
+        str(tmp_path / "archive"),
+        str(tmp_path / "external"),
+    ]
+
+
+def test_forge_uses_persisted_primary_model_root(tmp_path, monkeypatch):
+    import mtplx.commands.forge as forge
+
+    config = tmp_path / "config.toml"
+    primary = tmp_path / "primary"
+    config.write_text(f'model_dir = "{primary}"\n', encoding="utf-8")
+    monkeypatch.setenv("MTPLX_CONFIG", str(config))
+    captured: dict[str, object] = {}
+
+    def fake_handler(args, *, model_root=None):
+        captured["action"] = args.forge_action
+        captured["model_root"] = model_root
+        return 0
+
+    monkeypatch.setattr(forge, "cmd_forge_public", fake_handler)
+
+    assert main(["forge", "probe", "owner/model", "--json"]) == 0
+    assert captured == {"action": "probe", "model_root": str(primary)}
+
+
+def test_forge_build_explicit_model_root_overrides_persisted_root(
+    tmp_path, monkeypatch
+):
+    import mtplx.commands.forge as forge
+
+    config = tmp_path / "config.toml"
+    config.write_text('model_dir = "/models/config"\n', encoding="utf-8")
+    monkeypatch.setenv("MTPLX_CONFIG", str(config))
+    captured: dict[str, object] = {}
+
+    def fake_handler(args, *, model_root=None):
+        captured["model_root"] = model_root
+        return 0
+
+    monkeypatch.setattr(forge, "cmd_forge_public", fake_handler)
+
+    code = main(
+        [
+            "forge",
+            "build",
+            "--repo",
+            "owner/model",
+            "--out",
+            str(tmp_path / "out"),
+            "--run-id",
+            "run",
+            "--recipe",
+            "{}",
+            "--branded-name",
+            "Built",
+            "--model-root",
+            "/models/operation",
+        ]
+    )
+
+    assert code == 0
+    assert captured["model_root"] == "/models/operation"
 
 
 def test_compile_audit_dry_run_is_real_command(capsys):
@@ -9145,6 +9379,78 @@ def test_connect_opencode_actually_writes_the_config(tmp_path, monkeypatch, caps
     assert "qwen4-new-family-model" in models
     assert written["model"] == "mtplx/qwen4-new-family-model"
     assert "unrelated" in written["provider"], "other providers must survive"
+
+
+def _connect_opencode_written(tmp_path, monkeypatch, argv, *, health, pack_vision):
+    import json
+
+    from mtplx.cli import _cmd_connect, build_parser
+    from mtplx.commands import public
+
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text("{}")
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(config_path))
+    monkeypatch.setattr(public, "_http_json", lambda url, **kw: dict(health))
+    monkeypatch.setattr(public, "_model_vision_enabled", lambda ref: pack_vision)
+    args = build_parser().parse_args(["connect", "opencode", "--port", "18099", *argv])
+    assert _cmd_connect(args) == 0
+    return json.loads(config_path.read_text())
+
+
+def test_connect_opencode_follows_the_live_daemon_for_the_model_and_image_input(
+    tmp_path, monkeypatch
+):
+    """`mtplx connect opencode --port N` names no pack, so the daemon on N is
+    the source: its public model id and its vision flag (#472: the port-only
+    form advertised text-only and assumed the catalog default id)."""
+    written = _connect_opencode_written(
+        tmp_path,
+        monkeypatch,
+        [],
+        health={
+            "ok": True,
+            "model": "mtplx-flash-next-optimized-speed",
+            "vision": {"enabled": True, "formats": ["png"]},
+        },
+        pack_vision=False,
+    )
+    models = written["provider"]["mtplx"]["models"]
+    assert list(models) == ["mtplx-flash-next-optimized-speed"]
+    assert models["mtplx-flash-next-optimized-speed"]["modalities"]["input"] == [
+        "text",
+        "image",
+    ]
+    assert written["model"] == "mtplx/mtplx-flash-next-optimized-speed"
+
+
+def test_connect_opencode_explicit_model_id_wins_and_a_text_only_daemon_says_text(
+    tmp_path, monkeypatch
+):
+    written = _connect_opencode_written(
+        tmp_path,
+        monkeypatch,
+        ["--model-id", "qwen4-new-family-model"],
+        health={"ok": True, "model": "mtplx-other", "vision": {"enabled": False}},
+        pack_vision=True,
+    )
+    models = written["provider"]["mtplx"]["models"]
+    assert list(models) == ["qwen4-new-family-model"]
+    assert models["qwen4-new-family-model"]["modalities"]["input"] == ["text"]
+
+
+def test_connect_opencode_without_a_daemon_keeps_the_pack_answer(tmp_path, monkeypatch):
+    written = _connect_opencode_written(
+        tmp_path,
+        monkeypatch,
+        ["--model-id", "mtplx-qwen38-27b-optimized-speed"],
+        health={"ok": False, "error": "connection refused"},
+        pack_vision=True,
+    )
+    models = written["provider"]["mtplx"]["models"]
+    assert models["mtplx-qwen38-27b-optimized-speed"]["modalities"]["input"] == [
+        "text",
+        "image",
+    ]
 
 
 def test_connect_opencode_refuses_an_unreadable_config_without_touching_it(

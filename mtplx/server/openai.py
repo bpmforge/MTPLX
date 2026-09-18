@@ -6,6 +6,10 @@ can exercise the native-MTP runtime without turning MTPLX into a deployment
 server yet. The default live path preserves the single-user MTP oracle; the
 opt-in concurrent lane batches AR fallback work on the same single MLX owner
 thread so coding-agent bursts do not require parallel model loops.
+
+The Responses API adapter is stateless and text-only. It supports
+client-executed function/custom tools and namespace-grouped functions; MTPLX
+does not host web search, tool search, MCP, code interpreter, or similar tools.
 """
 
 # ruff: noqa: E402
@@ -15,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import asyncio
+import inspect
 import traceback
 import builtins
 import errno
@@ -122,7 +127,7 @@ from mtplx.reasoning_effort import (
     normalize_reasoning_effort as _normalize_reasoning_effort,
 )
 from mtplx.retrieval import RetrievalError, RetrievalTrustError
-from mtplx.sampling import SamplerConfig
+from mtplx.sampling import NonFiniteLogitsError, SamplerConfig
 from mtplx.server.request_policy import (
     BackgroundBusyBypass,
     resolve_request_policy,
@@ -183,6 +188,7 @@ from mtplx.server.mtp_batch import (
     MTPBatchGenerationService,
     MTPBatchJob,
 )
+from mtplx.server import responses as responses_api
 from mtplx.server.omlx_bridge import (
     ToolCallStreamFilter as OMLXToolCallStreamFilter,
     extract_thinking as omlx_extract_thinking,
@@ -761,15 +767,33 @@ _STATS_FOOTER_RE = re.compile(
 )
 
 
-def _fast_path_env_status() -> dict[str, dict[str, Any]]:
-    return {
-        key: {
+def _fast_path_env_status(
+    runtime_env_overrides: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Per-key fast-path env verdicts for ``/health``.
+
+    The expectation is the profile block, except where the server itself
+    resolved a runtime override for the served model (Flash-Next keeps the
+    verify snapshot and pins the batched target distributions, for
+    example): there the override is the truth the process runs with, so it
+    is the expectation and the entry names its source. Before this the app
+    daemon reported ``ok: false`` on three keys it set on purpose.
+    """
+    overrides = dict(runtime_env_overrides or {})
+    status: dict[str, dict[str, Any]] = {}
+    for key, profile_expected in FAST_PATH_ENV.items():
+        expected = overrides.get(key, profile_expected)
+        observed = os.environ.get(key)
+        entry: dict[str, Any] = {
             "expected": expected,
-            "observed": os.environ.get(key),
-            "ok": os.environ.get(key) == expected,
+            "observed": observed,
+            "ok": observed == expected,
         }
-        for key, expected in FAST_PATH_ENV.items()
-    }
+        if key in overrides:
+            entry["source"] = "runtime_override"
+            entry["profile_expected"] = profile_expected
+        status[key] = entry
+    return status
 
 
 def _server_runtime_env_overrides(
@@ -922,7 +946,15 @@ def _server_runtime_env_overrides(
                 # keeps a re-rendered agent turn on its boundary snapshots
                 # instead of a cold re-prefill.
                 "MTPLX_QWEN4_OPDIET",
-                "MTPLX_QWEN4_BLOCK_VERIFY",
+                # MTPLX_QWEN4_BLOCK_VERIFY is deliberately NOT stamped. The
+                # exact block law (qwen4_block_verify.py) and the standard
+                # verify are both distribution-exact; on the 2026-09-16
+                # overnight A/B (founder's 45k-token xhigh reasoning turn,
+                # Flash-Next Optimized Speed, alternating boots, max fans)
+                # the block lane accepted 2.90 draft tokens per round against
+                # 3.00 for the standard verify and 3.01 for 2.11.2, a 3.5%
+                # loss the 8.8k-token code receipt of 2026-09-08 (a tie) did
+                # not show. It stays an opt-in export.
                 "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
                 "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
                 # PR #475 (davidtai), measured at the 16,384/1,024 cell on the
@@ -1537,6 +1569,9 @@ class ChatCompletionRequest(BaseModel):
     # logprobs as "model returned none" rather than "server ignored me".
     logprobs: Any = None
     top_logprobs: int | None = None
+    # Internal adapter control: Responses clients must never receive the
+    # browser-facing MTPLX TPS footer as model output.
+    suppress_stats_footer: bool = False
 
 
 @dataclass
@@ -2996,6 +3031,12 @@ class ServerState:
         from mtplx.retrieval import registry_from_args
 
         self.retrieval = registry_from_args(args)
+        # Same contract as the chat model: a reference that does not resolve
+        # refuses the launch. Before this, a mistyped or unpulled
+        # --embedding-model booted a daemon that printed "MTPLX is ready",
+        # listed the model on /v1/models, and then raised FileNotFoundError
+        # out of the loader on the first request (HTTP 500 with a traceback).
+        _refuse_unresolvable_retrieval_models(self.retrieval)
         self.started_at_s = time.time()
         self.lock = Lock()
         self.foreground_lock = Lock()
@@ -3133,7 +3174,9 @@ class ServerState:
                         "MTPLX profile env is incomplete: "
                         + json.dumps(bad_profile_env, sort_keys=True)
                     )
-            self.fast_path_env_status = _fast_path_env_status()
+            self.fast_path_env_status = _fast_path_env_status(
+                runtime_env_overrides=self.runtime_env_overrides
+            )
         _startup_line("[4/6] Checking local acceleration runtime")
         _startup_line("      This may take a few seconds.")
         self.mlx_runtime_status = _mlx_runtime_status()
@@ -3747,11 +3790,25 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         )
         or DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
     )
+    console = bool(getattr(args, "server_console", False))
+
+    def _reconcile_event(summary: dict[str, Any]) -> None:
+        # One line per daemon start (#493): what the store held and what the
+        # opening reconciliation reclaimed. Same stdout event stream as
+        # mtplx_openai_generation, so the app's daemon log carries it.
+        if console:
+            return
+        _safe_stdout_print(
+            json.dumps({"event": "mtplx_ssd_session_cache_reconcile", **summary}),
+            flush=True,
+        )
+
     return SessionBankColdTier(
         base_dir=cache_dir,
         mode=mode,
         max_bytes=max_bytes,
         min_prefix_tokens=min_prefix_tokens,
+        reconcile_listener=_reconcile_event,
     )
 
 
@@ -4836,17 +4893,37 @@ def _path_is_same_origin_only(path: str) -> bool:
     return any(path == root or path.startswith(root + "/") for root in _SAME_ORIGIN_ONLY_ROOTS)
 
 
+_ORIGIN_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*$")
+
+
+def _origin_default_port(scheme: str) -> int:
+    """80 and 443 for the web schemes; 0 (no port) for app schemes such as tauri://."""
+
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return 0
+
+
 def _normalize_origin(value: str) -> tuple[str, str, int]:
-    """Return (scheme, host, port) for an origin string, or raise ValueError."""
+    """Return (scheme, host, port) for an origin string, or raise ValueError.
+
+    Any RFC 3986 scheme is an origin scheme (RFC 6454): desktop web views
+    present ``tauri://localhost``, ``app://obsidian.md`` or
+    ``capacitor://localhost``, and an operator must be able to allowlist
+    them. A wildcard, a bare host, a path, a query, or credentials are
+    still refused.
+    """
 
     text = str(value or "").strip().rstrip("/")
     parts = urllib.parse.urlsplit(text)
     scheme = (parts.scheme or "").lower()
-    if scheme not in {"http", "https"} or not parts.hostname:
+    if not _ORIGIN_SCHEME_RE.match(scheme) or not parts.hostname:
         raise ValueError(f"not an origin (expected scheme://host[:port]): {value!r}")
     if parts.path or parts.query or parts.fragment or parts.username or parts.password:
         raise ValueError(f"an origin has no path, query, or credentials: {value!r}")
-    port = parts.port if parts.port is not None else (443 if scheme == "https" else 80)
+    port = parts.port if parts.port is not None else _origin_default_port(scheme)
     return scheme, parts.hostname.lower(), int(port)
 
 
@@ -4864,7 +4941,7 @@ def _parse_cors_origins(values: Iterable[str] | None, env_value: str | None = No
             if not piece:
                 continue
             scheme, host, port = _normalize_origin(piece)
-            default_port = 443 if scheme == "https" else 80
+            default_port = _origin_default_port(scheme)
             hostname = f"[{host}]" if ":" in host else host
             origin = f"{scheme}://{hostname}" + ("" if port == default_port else f":{port}")
             if origin not in normalized:
@@ -5106,6 +5183,36 @@ _VISION_EMBED_CACHE: (
     "OrderedDict[tuple[str, int], tuple[Any, int, tuple[int, int, int]]]"
 ) = OrderedDict()
 _VISION_EMBED_CACHE_MAX_ROWS = 32768
+# The cache is read on the request path and on the model-owner thread's
+# generation-final commit; mutations of the OrderedDict are serialized here.
+# The tower forward itself never runs under this lock.
+_VISION_EMBED_CACHE_LOCK = threading.Lock()
+
+
+def _vision_embed_cache_evict_locked(pinned: frozenset[tuple[str, int]]) -> None:
+    """Trim the row-budgeted LRU, never evicting a pinned key.
+
+    Issue #487: an agent history whose screenshots together exceed the row
+    budget scanned the LRU sequentially -- the request embedded images
+    1..K and evicted the oldest ones on the way, so the generation-final
+    commit (which walks the same images in the same order) missed on
+    every one of them and re-ran the tower K times on the model-owner
+    thread; the commit that normally takes 0.2 s took 20-25 s. The
+    images of the prompt being materialized are pinned for the pass, so
+    a prompt is never evicted by itself and its commit hits 100%. The
+    cache may exceed the budget by at most one prompt's rows, which are
+    resident in that prompt's KV anyway.
+    """
+    cached_rows = sum(entry[1] for entry in _VISION_EMBED_CACHE.values())
+    if cached_rows <= _VISION_EMBED_CACHE_MAX_ROWS:
+        return
+    for key in list(_VISION_EMBED_CACHE.keys()):
+        if cached_rows <= _VISION_EMBED_CACHE_MAX_ROWS or len(_VISION_EMBED_CACHE) <= 1:
+            return
+        if key in pinned:
+            continue
+        evicted = _VISION_EMBED_CACHE.pop(key)
+        cached_rows -= evicted[1]
 
 
 def _vision_embed_cache_enabled() -> bool:
@@ -5139,9 +5246,22 @@ def _image_content_digest(raw: bytes) -> int:
 
 
 def _vision_rows_for_image(
-    state: Any, model_dir: Any, preprocessor_config: dict, raw: bytes, digest: int
+    state: Any,
+    model_dir: Any,
+    preprocessor_config: dict,
+    raw: bytes,
+    digest: int,
+    *,
+    pinned: frozenset[tuple[str, int]] | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> tuple[Any, int, tuple[int, int, int]]:
-    """Embedding rows, pad count and (t, h, w) grid for one image (digest LRU)."""
+    """Embedding rows, pad count and (t, h, w) grid for one image (digest LRU).
+
+    ``pinned`` names the cache keys of the prompt currently being
+    materialized; they survive this call's eviction pass (see
+    _vision_embed_cache_evict_locked). ``timing`` (caller-owned) receives
+    hit/miss counts and the tower wall so a slow commit can be attributed.
+    """
 
     from mtplx.vision import load_vision_tower
     from mtplx.vision.processing import (
@@ -5152,10 +5272,15 @@ def _vision_rows_for_image(
 
     cache_key = (str(model_dir), int(digest))
     if _vision_embed_cache_enabled():
-        hit = _VISION_EMBED_CACHE.get(cache_key)
+        with _VISION_EMBED_CACHE_LOCK:
+            hit = _VISION_EMBED_CACHE.get(cache_key)
+            if hit is not None:
+                _VISION_EMBED_CACHE.move_to_end(cache_key)
         if hit is not None:
-            _VISION_EMBED_CACHE.move_to_end(cache_key)
+            if timing is not None:
+                timing["vision_cache_hits"] = int(timing.get("vision_cache_hits", 0)) + 1
             return hit
+    tower_started = time.perf_counter()
     pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
     pad_count = image_pad_token_count(grids[0])
     grid = tuple(int(x) for x in grids[0])
@@ -5164,19 +5289,26 @@ def _vision_rows_for_image(
     import mlx.core as _mx
 
     _mx.eval(rows)
+    if timing is not None:
+        timing["vision_tower_misses"] = int(timing.get("vision_tower_misses", 0)) + 1
+        timing["vision_tower_s"] = float(timing.get("vision_tower_s", 0.0)) + (
+            time.perf_counter() - tower_started
+        )
     if _vision_embed_cache_enabled():
-        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count, grid)
-        cached_rows = sum(entry[1] for entry in _VISION_EMBED_CACHE.values())
-        while (
-            cached_rows > _VISION_EMBED_CACHE_MAX_ROWS and len(_VISION_EMBED_CACHE) > 1
-        ):
-            _, evicted = _VISION_EMBED_CACHE.popitem(last=False)
-            cached_rows -= evicted[1]
+        with _VISION_EMBED_CACHE_LOCK:
+            _VISION_EMBED_CACHE[cache_key] = (rows, pad_count, grid)
+            _vision_embed_cache_evict_locked(
+                (pinned or frozenset()) | frozenset({cache_key})
+            )
     return rows, pad_count, grid
 
 
 def _materialize_vision_splice(
-    state: Any, images: list[bytes], prompt_ids: list[int]
+    state: Any,
+    images: list[bytes],
+    prompt_ids: list[int],
+    *,
+    timing: dict[str, Any] | None = None,
 ) -> tuple[list[int], Any]:
     """Run the tower (or its digest cache) and return (expanded ids, splice)."""
 
@@ -5192,16 +5324,23 @@ def _materialize_vision_splice(
     preprocessor_config = _json.loads(
         (model_dir / "preprocessor_config.json").read_text(encoding="utf-8")
     )
-    digests: list[int] = []
+    digests: list[int] = [_image_content_digest(raw) for raw in images]
+    # Every image of THIS prompt stays cached for the whole pass (#487):
+    # the eviction that runs after each insert skips these keys.
+    pinned = frozenset((str(model_dir), int(digest)) for digest in digests)
     row_blocks: list[Any] = []
     pad_counts: list[int] = []
     grids: list[tuple[int, int, int]] = []
-    for raw in images:
-        digest = _image_content_digest(raw)
+    for raw, digest in zip(images, digests):
         rows, pad_count, grid = _vision_rows_for_image(
-            state, model_dir, preprocessor_config, raw, digest
+            state,
+            model_dir,
+            preprocessor_config,
+            raw,
+            digest,
+            pinned=pinned,
+            timing=timing,
         )
-        digests.append(digest)
         row_blocks.append(rows)
         pad_counts.append(pad_count)
         grids.append(grid)
@@ -6796,7 +6935,17 @@ def _initial_orphan_tool_control_state(text: str) -> str:
         if any(marker.startswith(lowered) for marker in partial_markers):
             return "hold"
         return "normal"
-    first_line = lowered.splitlines()[0]
+    first_raw = lowered.splitlines(keepends=True)[0]
+    first_line = first_raw.splitlines()[0]
+    if len(first_raw) > len(first_line):
+        # Issue #468: a bare tool-control line carries its ">" on the same
+        # line (the orphan forms matched above never span a line break), so
+        # once the first line is closed nothing that follows can turn it into
+        # a marker. Without this exit a first line that equals, prefixes or
+        # opens a bare name ("value", "valu", "value=abc") stayed in hold and
+        # the whole answer was buffered until finish(): minutes of silence on
+        # a long stream, long enough to trip client stream watchdogs.
+        return "normal"
     for name in (name.lower() for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES):
         if name.startswith(first_line):
             return "hold"
@@ -8528,7 +8677,11 @@ def _normalize_tool_specs(tools: list[dict[str, Any]] | None) -> list[dict[str, 
                 status_code=400,
                 detail=f"tools[{index}] must include a function name",
             )
-        normalized.append(tool)
+        # JSON object order is not schema semantics. Native chat templates
+        # render that order verbatim, so a client's fresh JSON encoding must
+        # not change the system prefix and force a full-history prefill.
+        # Preserve list order (tools, enums, required fields) and every value.
+        normalized.append(json.loads(json.dumps(tool, sort_keys=True)))
     return normalized
 
 
@@ -11503,6 +11656,64 @@ def _tool_call_loop_key(tool_call: dict[str, Any]) -> tuple[str, str, str] | Non
     return name, key_payload, command or key_payload
 
 
+def _canonical_tool_argument(value: Any) -> Any:
+    """Argument value in the one shape both tool-call dialects reduce to.
+
+    The client echoes structured JSON (ints, bools, nested lists); the
+    committed stream carries the model's own ``<parameter=k>v</parameter>``
+    text, where every value is a string and a nested value is JSON text. Both
+    sides meet here: containers recurse, JSON-looking strings are parsed and
+    recursed, scalars become stripped strings (``True`` -> ``"true"``).
+    Whitespace at the ends is not identity: the committed parser strips one
+    newline around a value and clients strip a trailing newline from
+    ``content`` (the 2026-09-03 write-turn seam), and neither changes what
+    the call does.
+    """
+
+    if isinstance(value, dict):
+        return {str(key): _canonical_tool_argument(item) for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_tool_argument(item) for item in value]
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] in "[{":
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text
+            if isinstance(parsed, (dict, list)):
+                return _canonical_tool_argument(parsed)
+        return text
+    return str(value).strip()
+
+
+def _tool_call_identity(tool_call: dict[str, Any]) -> tuple[str, str] | None:
+    """``(name, canonical arguments JSON)``: the call's complete identity.
+
+    This is what the committed-reasoning gate compares. The loop key above is
+    deliberately lossy (it names a command or a path so a retried tool call
+    can be recognised as a repeat); it must never decide whether two calls
+    are the same call, because a ``write`` to the same path with different
+    content compares equal under it and the gate then put the OLD content
+    back into the prompt (Codex audit, 2026-09-08). None when the call has
+    no confident name (callers treat None as a mismatch).
+    """
+
+    name = _tool_call_name(tool_call)
+    if not name:
+        return None
+    args = _canonical_tool_argument(_tool_call_arguments(tool_call))
+    try:
+        payload = json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except TypeError:
+        payload = str(args)
+    return name, payload
+
+
 def _tool_result_is_timeout(text: str) -> bool:
     if not text:
         return False
@@ -13107,6 +13318,10 @@ _COMMITTED_TURN_OPEN = "<|im_start|>assistant\n"
 _COMMITTED_TURN_CLOSE = "<|im_end|>"
 _COMMITTED_THINK_OPEN = "<think>\n"
 _COMMITTED_THINK_CLOSE = "</think>"
+_COMMITTED_GEMMA4_TURN_OPEN = "<|turn>model\n"
+_COMMITTED_GEMMA4_TURN_CLOSE = "<turn|>"
+_COMMITTED_GEMMA4_THINK_OPEN = "<|channel>thought\n"
+_COMMITTED_GEMMA4_THINK_CLOSE = "<channel|>"
 
 
 def _committed_reasoning_canonicalization_enabled() -> bool:
@@ -13120,6 +13335,138 @@ def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
         if a[i] != b[i]:
             return i
     return n
+
+
+_COMMITTED_SPLICE_WINDOW = 8
+_COMMITTED_SPLICE_MAX_SPANS = 256
+
+
+def _is_chat_control_token(tokenizer: Any, token_id: int) -> bool:
+    """A chat-template control token (``<|im_end|>``, ``<end_of_turn>``)."""
+    special = getattr(tokenizer, "all_special_ids", None)
+    try:
+        if special and int(token_id) in {int(x) for x in special}:
+            return True
+    except Exception:
+        pass
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        return False
+    return isinstance(text, str) and len(text) > 2 and text[0] == "<" and text[-1] == ">"
+
+
+def _splice_committed_token_ids(
+    prompt_ids: Sequence[int],
+    committed: Sequence[int],
+    tokenizer: Any,
+    *,
+    window: int = _COMMITTED_SPLICE_WINDOW,
+    max_spans: int = _COMMITTED_SPLICE_MAX_SPANS,
+) -> tuple[list[int], dict[str, Any]]:
+    """Re-express ``prompt_ids`` with the session's committed ids wherever the
+    two decode to the same text.
+
+    A model's sampled token sequence is not always the canonical BPE encoding
+    of its own text: the 2026-09-08 Hermes receipt had ``"Nothing`` emitted
+    as one token 8,498 tokens into a write_file call where the tokenizer
+    encodes ``"`` + ``Nothing``. The client's re-tokenized history then
+    diverges from the committed stream at that spot, the generation-final
+    snapshot is refused, and the next turn re-prefills the whole assistant
+    turn (30,038 tokens, 41 s TTFT). The bytes are identical; only the token
+    boundaries differ, and the KV state the model built belongs to its own
+    ids. At each divergence this walks a bounded window on both sides for
+    the shortest pair of token runs with the same decoded text and takes the
+    committed run; a window that does not re-synchronise (a real edit) ends
+    the splice and the rest of the prompt is kept as sent. Windows whose
+    text carries a replacement character (a split multi-byte character) are
+    never matched. Returns the ids and a receipt.
+    """
+
+    prompt = [int(token) for token in prompt_ids]
+    stream = [int(token) for token in committed]
+    receipt: dict[str, Any] = {"spans": 0, "tokens_in": 0, "tokens_out": 0}
+    if not prompt or not stream:
+        return prompt, receipt
+    common = _common_prefix_len(prompt, stream)
+    if common >= len(prompt) or common >= len(stream):
+        return prompt, receipt
+
+    def _text(ids: Sequence[int]) -> str | None:
+        try:
+            text = tokenizer.decode(list(ids))
+        except Exception:
+            return None
+        if not isinstance(text, str) or not text or "\ufffd" in text:
+            return None
+        return text
+
+    out: list[int] = prompt[:common]
+    p = common
+    c = common
+    spans = 0
+    while p < len(prompt) and c < len(stream):
+        if prompt[p] == stream[c]:
+            out.append(prompt[p])
+            p += 1
+            c += 1
+            continue
+        if spans >= max_spans:
+            break
+        # Whitespace the response stripped. The visible content is served
+        # with its leading and trailing whitespace removed, so the model's
+        # own whitespace tokens are missing from the re-rendered history
+        # (a length-cut turn ending in a newline: committed ``:``, ``\n``,
+        # history ``:``, ``<|im_end|>``). Put them back where the streams
+        # re-align right after them, or where the committed stream ends
+        # with them and the prompt goes on with a chat-control token.
+        ws = 0
+        while ws < window and c + ws < len(stream):
+            piece = _text(stream[c + ws : c + ws + 1])
+            if piece is None or piece.strip():
+                break
+            ws += 1
+        if ws:
+            end = c + ws
+            realigned = end < len(stream) and stream[end] == prompt[p]
+            tail = end == len(stream) and _is_chat_control_token(tokenizer, prompt[p])
+            if realigned or tail:
+                out.extend(stream[c:end])
+                receipt["whitespace_tokens"] = int(receipt.get("whitespace_tokens", 0)) + ws
+                spans += 1
+                c = end
+                continue
+        found: tuple[int, int] | None = None
+        for total in range(2, 2 * window + 1):
+            for dp in range(1, min(window, total - 1) + 1):
+                dc = total - dp
+                if dc < 1 or dc > window:
+                    continue
+                if p + dp > len(prompt) or c + dc > len(stream):
+                    continue
+                left = _text(prompt[p : p + dp])
+                if left is None:
+                    continue
+                if left == _text(stream[c : c + dc]):
+                    found = (dp, dc)
+                    break
+            if found is not None:
+                break
+        if found is None:
+            break
+        dp, dc = found
+        out.extend(stream[c : c + dc])
+        receipt["tokens_in"] += dp
+        receipt["tokens_out"] += dc
+        spans += 1
+        p += dp
+        c += dc
+    out.extend(prompt[p:])
+    receipt["spans"] = spans
+    if spans:
+        receipt["first_divergence"] = int(common)
+        receipt["cp_after"] = int(_common_prefix_len(out, stream))
+    return out, receipt
 
 
 class _CommittedTurn(tuple):
@@ -13139,6 +13486,8 @@ class _CommittedTurn(tuple):
 
 def _committed_assistant_turns(
     committed_text: str,
+    *,
+    gemma4: bool | None = None,
 ) -> list[tuple[str | None, str, str]]:
     """Per assistant turn of a decoded committed stream, in order:
     (think_interior, visible_content_gate, tool_call_markup).
@@ -13153,16 +13502,29 @@ def _committed_assistant_turns(
     calls (identical visible text, different call → the committed reasoning
     argues for the OLD call and must not be substituted). Parsing is
     marker-based on the same template specials the boundary helpers above
-    rely on.
+    rely on. Gemma 4 uses model turns and native channel markers instead of
+    ChatML assistant turns and ``<think>`` tags; both shapes reduce to this
+    same positional representation.
     """
+    if gemma4 is None:
+        # Callers that know the runtime pass its parser (a Qwen stream that
+        # merely quotes a Gemma turn marker must not flip the parser); the
+        # marker sniff is the fallback for bare text.
+        gemma4 = _COMMITTED_GEMMA4_TURN_OPEN in committed_text
+    turn_open = _COMMITTED_GEMMA4_TURN_OPEN if gemma4 else _COMMITTED_TURN_OPEN
+    turn_close = _COMMITTED_GEMMA4_TURN_CLOSE if gemma4 else _COMMITTED_TURN_CLOSE
+    think_open = _COMMITTED_GEMMA4_THINK_OPEN if gemma4 else _COMMITTED_THINK_OPEN
+    think_close = (
+        _COMMITTED_GEMMA4_THINK_CLOSE if gemma4 else _COMMITTED_THINK_CLOSE
+    )
     turns: list[tuple[str | None, str, str]] = []
     search_from = 0
     while True:
-        turn_at = committed_text.find(_COMMITTED_TURN_OPEN, search_from)
+        turn_at = committed_text.find(turn_open, search_from)
         if turn_at < 0:
             break
-        body_start = turn_at + len(_COMMITTED_TURN_OPEN)
-        turn_end = committed_text.find(_COMMITTED_TURN_CLOSE, body_start)
+        body_start = turn_at + len(turn_open)
+        turn_end = committed_text.find(turn_close, body_start)
         body = (
             committed_text[body_start:turn_end]
             if turn_end >= 0
@@ -13170,15 +13532,20 @@ def _committed_assistant_turns(
         )
         think_interior: str | None = None
         content_part = body
-        if body.startswith(_COMMITTED_THINK_OPEN):
-            close_at = body.find(_COMMITTED_THINK_CLOSE, len(_COMMITTED_THINK_OPEN))
+        if body.startswith(think_open):
+            close_at = body.find(think_close, len(think_open))
             if close_at >= 0:
-                interior = body[len(_COMMITTED_THINK_OPEN) : close_at]
+                interior = body[len(think_open) : close_at]
                 # The template re-renders '<think>\n' + rc|trim + '\n</think>':
                 # a generated interior of the shape '{rc}\n' round-trips
                 # byte-exactly with rc stripped of the single trailing newline.
-                think_interior = interior[:-1] if interior.endswith("\n") else interior
-                content_part = body[close_at + len(_COMMITTED_THINK_CLOSE) :]
+                if gemma4:
+                    think_interior = interior
+                else:
+                    think_interior = (
+                        interior[:-1] if interior.endswith("\n") else interior
+                    )
+                content_part = body[close_at + len(think_close) :]
         markup_at = content_part.find("<tool_call")
         if markup_at >= 0:
             gate = content_part[:markup_at].strip()
@@ -13204,24 +13571,21 @@ _COMMITTED_PARAMETER_RE = re.compile(
 )
 
 
-def _committed_turn_tool_keys(tool_markup: str) -> list[tuple[str, str, str]] | None:
-    """Loop keys of a committed turn's tool-call markup, or None if the
-    markup cannot be parsed confidently.
+def _committed_turn_tool_calls(tool_markup: str) -> list[dict[str, Any]] | None:
+    """The tool calls a committed turn's markup carries, as ``{name, arguments}``
+    dicts, or None if the markup cannot be parsed confidently.
 
     Committed streams carry two markup dialects: the template's native
-    ``<tool_call>\\n{json}\\n</tool_call>`` re-render of structured history
+    ``<tool_call>\n{json}\n</tool_call>`` re-render of structured history
     and the contract's ``<function=name><parameter=k>v`` form the model
-    emits live. Both reduce to the same :func:`_tool_call_loop_key`
-    identity used for the incoming structured tool_calls, so the gate
-    compares like with like. None (unparseable) must be treated as a
-    mismatch by callers — refusing substitution is always safe; guessing
-    is not.
+    emits live. None (unparseable) must be treated as a mismatch by callers:
+    refusing substitution is always safe; guessing is not.
     """
     if not tool_markup:
         return []
     if "<tool_call" not in tool_markup:
         return []
-    keys: list[tuple[str, str, str]] = []
+    calls: list[dict[str, Any]] = []
     matched_any = False
     for match in _COMMITTED_TOOL_CALL_BLOCK_RE.finditer(tool_markup):
         matched_any = True
@@ -13248,13 +13612,53 @@ def _committed_turn_tool_keys(tool_markup: str) -> list[tuple[str, str, str]] | 
             call = {"name": name_match.group(1), "arguments": params}
         else:
             return None
+        calls.append(call)
+    if not matched_any:
+        return None
+    return calls
+
+
+def _committed_turn_tool_keys(tool_markup: str) -> list[tuple[str, str, str]] | None:
+    """Loop keys of a committed turn's tool calls (repeat detection only)."""
+    calls = _committed_turn_tool_calls(tool_markup)
+    if calls is None:
+        return None
+    keys: list[tuple[str, str, str]] = []
+    for call in calls:
         key = _tool_call_loop_key(call)
         if key is None:
             return None
         keys.append(key)
-    if not matched_any:
-        return None
     return keys
+
+
+def _committed_turn_tool_identities(tool_markup: str) -> list[tuple[str, str]] | None:
+    """Complete identities of a committed turn's tool calls (the gate)."""
+    calls = _committed_turn_tool_calls(tool_markup)
+    if calls is None:
+        return None
+    identities: list[tuple[str, str]] = []
+    for call in calls:
+        identity = _tool_call_identity(call)
+        if identity is None:
+            return None
+        identities.append(identity)
+    return identities
+
+
+def _incoming_tool_identities(
+    tool_calls: list[dict[str, Any]] | None,
+) -> list[tuple[str, str]] | None:
+    """Complete identities of an incoming turn's structured tool_calls."""
+    if not tool_calls:
+        return []
+    identities: list[tuple[str, str]] = []
+    for tool_call in tool_calls:
+        identity = _tool_call_identity(tool_call)
+        if identity is None:
+            return None
+        identities.append(identity)
+    return identities
 
 
 def _incoming_tool_loop_keys(
@@ -13340,16 +13744,19 @@ def _substitute_committed_reasoning_messages(
             canon_messages.append(message)
             continue
         interior, gate, tool_markup = committed_turns[ordinal]
-        incoming_keys = _incoming_tool_loop_keys(message.tool_calls)
-        committed_keys = _committed_turn_tool_keys(tool_markup)
+        incoming_identity = _incoming_tool_identities(message.tool_calls)
+        committed_identity = _committed_turn_tool_identities(tool_markup)
         if (
-            incoming_keys is None
-            or committed_keys is None
-            or incoming_keys != committed_keys
+            incoming_identity is None
+            or committed_identity is None
+            or incoming_identity != committed_identity
         ):
             # Tool-call identity is part of the gate: a branch switch that
             # changed ONLY the tool calls must not inherit reasoning that
-            # argued for the old calls (prefix rule, mirrors restore).
+            # argued for the old calls (prefix rule, mirrors restore). The
+            # identity is the COMPLETE argument set: the lossy loop key
+            # (command / path only) let a write to the same path with new
+            # content pass, and the substitution then served the old body.
             substitution_open = False
             canon_messages.append(message)
             continue
@@ -13483,14 +13890,19 @@ def _maybe_canonicalize_committed_reasoning(
 
     if not _committed_reasoning_canonicalization_enabled():
         return None
+    # With thinking off there is no reasoning to put back, but the model's
+    # own token seams still exist (a length-cut turn, a non-canonical BPE
+    # split inside a code line), so the token splice must still run; only
+    # the reasoning substitution stands aside.
+    splice_only_reason: str | None = None
     if not thinking_enabled:
-        _declined("thinking_disabled")
-        return None
-    if getattr(state.args, "strip_assistant_reasoning_history", False):
-        _declined("reasoning_history_stripped")
-        return None
-    if _reasoning_history_scoped_active(state):
-        _declined("reasoning_history_scoped")
+        splice_only_reason = "thinking_disabled"
+    elif getattr(state.args, "strip_assistant_reasoning_history", False):
+        splice_only_reason = "reasoning_history_stripped"
+    elif _reasoning_history_scoped_active(state):
+        splice_only_reason = "reasoning_history_scoped"
+    if splice_only_reason is not None and not _committed_token_splice_enabled():
+        _declined(splice_only_reason)
         return None
     # Prologue scrub (audit F11 P2): a client-planted committed-reasoning
     # field must never survive into any later encode, including when this
@@ -13535,6 +13947,15 @@ def _maybe_canonicalize_committed_reasoning(
         if target is not None:
             target["committed_reasoning_canonicalization"] = outcome
 
+    if splice_only_reason is not None:
+        outcome["declined"] = splice_only_reason
+        spliced = _splice_prompt_onto_committed(
+            state, messages, prompt_ids, committed, cp_raw, outcome
+        )
+        _record(template_observability)
+        _record(request_observability)
+        return spliced
+
     dropped_assistant_turns = _transcript_dropped_assistant_turns(transcript_stats)
     if dropped_assistant_turns > 0:
         # Ordinal-drift refusal (audit F11 #2): transcript canonicalization
@@ -13552,9 +13973,18 @@ def _maybe_canonicalize_committed_reasoning(
         committed_text = state.runtime.tokenizer.decode(list(committed))
     except Exception:
         return None
-    committed_turns = _committed_assistant_turns(committed_text)
+    committed_turns = _committed_assistant_turns(
+        committed_text,
+        gemma4=_reasoning_parser_for_state(state) == "gemma4",
+    )
     if not any(interior for interior, _gate, _markup in committed_turns):
-        return None
+        spliced = _splice_prompt_onto_committed(
+            state, messages, prompt_ids, committed, cp_raw, outcome
+        )
+        if spliced is not None:
+            _record(template_observability)
+            _record(request_observability)
+        return spliced
 
     canon_messages, substituted = _substitute_committed_reasoning_messages(
         messages,
@@ -13564,9 +13994,12 @@ def _maybe_canonicalize_committed_reasoning(
     outcome["turns_substituted"] = int(substituted)
 
     if substituted == 0:
+        spliced = _splice_prompt_onto_committed(
+            state, messages, prompt_ids, committed, cp_raw, outcome
+        )
         _record(template_observability)
         _record(request_observability)
-        return None
+        return spliced
     canon_observability: dict[str, Any] = {}
     canon_ids = _encode_messages(
         state.runtime.tokenizer,
@@ -13585,15 +14018,56 @@ def _maybe_canonicalize_committed_reasoning(
     cp_canon = _common_prefix_len(canon_ids, committed)
     outcome["cp_canon"] = int(cp_canon)
     if cp_canon <= cp_raw:
+        spliced = _splice_prompt_onto_committed(
+            state, messages, prompt_ids, committed, cp_raw, outcome
+        )
         _record(template_observability)
         _record(request_observability)
-        return None
+        return spliced
     outcome["applied"] = True
     template_observability.clear()
     template_observability.update(canon_observability)
+    # The substituted encode can still carry a non-canonical spot of the
+    # model's own making inside the bytes it just put back; splice past it.
+    spliced = _splice_prompt_onto_committed(
+        state, canon_messages, canon_ids, committed, cp_canon, outcome
+    )
     _record(template_observability)
     _record(request_observability)
+    if spliced is not None:
+        return spliced
     return canon_messages, canon_ids
+
+
+def _splice_prompt_onto_committed(
+    state: ServerState,
+    messages: list[ChatMessage],
+    prompt_ids: Sequence[int],
+    committed: Sequence[int],
+    cp_before: int,
+    outcome: dict[str, Any],
+) -> tuple[list[ChatMessage], list[int]] | None:
+    """Serve the committed ids for text-identical spans (see
+    ``_splice_committed_token_ids``); None when nothing improved."""
+    if not _committed_token_splice_enabled():
+        return None
+    spliced_ids, receipt = _splice_committed_token_ids(
+        prompt_ids, committed, state.runtime.tokenizer
+    )
+    if not receipt.get("spans"):
+        return None
+    cp_after = int(receipt.get("cp_after") or 0)
+    outcome["token_splice"] = receipt
+    if cp_after <= int(cp_before):
+        return None
+    outcome["applied"] = True
+    outcome["cp_spliced"] = cp_after
+    return list(messages), spliced_ids
+
+
+def _committed_token_splice_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_COMMITTED_TOKEN_SPLICE", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _qwen_plain_assistant_content_boundaries(rendered: str) -> list[int]:
@@ -13780,6 +14254,8 @@ def _transient_trailing_user_sentinel_texts() -> tuple[str, ...]:
         _mtplx_read_only_force_answer_contract_text(),
         _mtplx_pi_convergence_contract_text(),
         _mtplx_forced_tool_choice_text(),
+        _mtplx_no_tool_contract_text(),
+        _mtplx_post_tool_answer_contract_text(),
     )
 
 
@@ -13994,10 +14470,17 @@ def _encode_messages_uncached(
     # turn from scratch). Committed-think substitution still overwrites covered
     # turns inside _message_to_template_dict, so KV-exact bytes win wherever
     # they exist. Thinking-off and strip keep their pinned legacy renders.
-    include_reasoning = scoped_reasoning_history or (
-        preserve_reasoning_history
-        and enable_thinking
-        and not strip_assistant_reasoning_history
+    gemma4_encoding = is_gemma4_tokenizer(tokenizer)
+    include_reasoning = (
+        scoped_reasoning_history
+        or (
+            preserve_reasoning_history
+            and enable_thinking
+            and not strip_assistant_reasoning_history
+        )
+        # Gemma 4's direct encoder needs the echoed reasoning to reproduce the
+        # committed token stream even when the general preserve mode is off.
+        or (gemma4_encoding and not strip_assistant_reasoning_history)
     )
     prepared_messages: list[dict[str, Any]] = []
     for message in messages:
@@ -14040,7 +14523,7 @@ def _encode_messages_uncached(
             template_observability["native_agent_tail_contract_active"] = bool(
                 native_tail_added
             )
-    if is_gemma4_tokenizer(tokenizer):
+    if gemma4_encoding:
         if template_observability is not None:
             template_observability["backend_chat_encoding"] = "gemma4"
         native_tools = (
@@ -14402,7 +14885,6 @@ def _postcommit_next_turn_prefix_ids(
         )
 
     normalized: list[dict[str, Any]] = []
-    last_history_role: str | None = None
     for message in history_messages:
         item = _message_to_template_dict(
             message,
@@ -14417,7 +14899,6 @@ def _postcommit_next_turn_prefix_ids(
         )
         if item is not None:
             normalized.append(item)
-            last_history_role = str(item.get("role") or "")
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
@@ -14627,6 +15108,12 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         )
     except Exception:
         pass
+    # Wall clock for the row. Every completion path (normal, cancelled,
+    # disconnected, the OpenCode title fast path) funnels through this sink,
+    # so stamping it here is what lets the dashboard's request log say when a
+    # request finished instead of rendering a dash. setdefault so a producer
+    # that already knows a more precise instant keeps it.
+    record.setdefault("completed_at_s", time.time())
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -14671,6 +15158,14 @@ def _json_safe(value: Any) -> Any:
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON has no inf or nan. FastAPI's encoder already turns them into
+        # null on the routes; the SSE stream and the request log serialize
+        # with json.dumps directly and emitted the bare Infinity/NaN tokens
+        # a browser's JSON.parse rejects (MTPLX_SESSION_BANK_IDLE_TTL_S=0
+        # makes the bank's idle_ttl_s infinite, and with it every dashboard
+        # snapshot event was unparseable).
+        return None
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     try:
@@ -15654,6 +16149,13 @@ def _metrics_envelope(
         "producer_gaps_over_200ms": producer_gaps_over_200ms,
         "mtp_depth": int(mtp_depth),
         "verify_calls": int(stats.get("verify_calls") or 0),
+        # Aggregate draft counters. They are part of the public stats block
+        # already, but the dashboard envelope only carried the per-depth
+        # breakdown, so the dashboard's "N accepted of M drafted" line read
+        # two keys that were never in the payload and rendered as dashes.
+        "accepted_drafts": int(stats.get("accepted_drafts") or 0),
+        "rejected_drafts": int(stats.get("rejected_drafts") or 0),
+        "drafted_tokens": int(stats.get("drafted_tokens") or 0),
         "accepted_by_depth": stats.get("accepted_by_depth") or [],
         "drafted_by_depth": stats.get("drafted_by_depth") or [],
         "mean_accept_probability_by_depth": (
@@ -15691,6 +16193,9 @@ def _metrics_envelope(
             stats.get("context_copy_accepted_tokens") or 0
         ),
         "context_copy_suspensions": int(stats.get("context_copy_suspensions") or 0),
+        "context_copy_capacity_growths": int(
+            stats.get("context_copy_capacity_growths") or 0
+        ),
         "context_copy_disabled_reason": stats.get("context_copy_disabled_reason"),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
@@ -17601,6 +18106,57 @@ def _is_allocation_failure(exc: BaseException) -> bool:
     return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
 
 
+def _is_non_finite_logits(exc: BaseException) -> bool:
+    return isinstance(exc, NonFiniteLogitsError)
+
+
+def _non_finite_logits_failure(
+    state: "ServerState",
+    exc: BaseException,
+    *,
+    request_id: str,
+    session_id: str | None = None,
+) -> str:
+    """Log, evict the session's banked state and word the wire message.
+
+    A NaN/inf logits row is a numerical fault upstream of the sampler (a
+    kernel, a quantized KV page, an overflowed fp16 activation). The state
+    that produced it may already sit in the session bank from the prompt
+    encode, so the session's entries are dropped: a warm restore of a
+    poisoned prefix would only reproduce the fault. The daemon stays up.
+    """
+
+    logging.getLogger("mtplx.server").error(
+        "non-finite logits request_id=%s session=%s: %s",
+        request_id,
+        session_id or "-",
+        exc,
+    )
+    dropped = 0
+    if session_id:
+        try:
+            bank = getattr(getattr(state, "sessions", None), "bank", None)
+            if bank is not None:
+                dropped = int(bank.clear(session_id=session_id) or 0)
+        except Exception:
+            dropped = 0
+    _record_guard_event(
+        state,
+        {
+            "action": "non_finite_logits",
+            "request_id": request_id,
+            "session_id": session_id,
+            "detail": str(exc),
+            "bank_entries_dropped": dropped,
+        },
+    )
+    return (
+        f"the model produced non-finite logits ({exc}); this request failed, "
+        "its session's cached state was dropped, and the daemon stays up "
+        f"(request_id={request_id})"
+    )
+
+
 def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
     """Ring buffer of guard actions for the dashboard/app (never raises)."""
     try:
@@ -18845,6 +19401,18 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
             out["ngram_prewarm"] = prewarm
     except Exception:
         pass
+    try:
+        from mtplx.models.qwen4_exp import verify_sdpa_head_chunk_report
+
+        # Present once the small-q_len verify SDPA has fired (like the other
+        # lanes: a receipt, not a null placeholder), so the battery can gate on
+        # the observable rather than the serve log. Its q_len/heads_per_chunk/
+        # chunks are the engagement proof for the 261K window.
+        receipt = verify_sdpa_head_chunk_report()
+        if receipt is not None:
+            out["verify_sdpa_head_chunk"] = receipt
+    except Exception:
+        pass
     return out
 
 
@@ -19496,6 +20064,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "context_copy_accepted_blocks",
     "context_copy_accepted_tokens",
     "context_copy_suspensions",
+    "context_copy_capacity_growths",
     "context_copy_suspended",
     "context_copy_backoff_tokens",
     "context_copy_disabled_reason",
@@ -20142,7 +20711,7 @@ def _request_observability(
         value = str(headers.get(f"x-mtplx-client-{name}-id") or "")
         if _CLIENT_REQUEST_ID_RE.fullmatch(value):
             client_links[f"request_client_{name}_id"] = value
-    return {
+    observability = {
         **client_links,
         "request_message_count": len(request.messages),
         "request_message_roles": [message.role for message in request.messages],
@@ -20174,6 +20743,7 @@ def _request_observability(
             else {}
         ),
     }
+    return observability
 
 
 def _last_user_text(messages: list[ChatMessage] | list[dict[str, Any]]) -> str:
@@ -20317,7 +20887,20 @@ def _bank_history_policy(state: "ServerState") -> str:
     whole prompt on every top-level turn (#465: 14.5k tokens, ~2 minutes per
     turn on an M1 Max; the idle stall in #455 on an M3 Ultra). One answer per
     runtime, derived here, used everywhere.
+
+    A backend that banks a different history shape declares it on its
+    descriptor and its restore side asks for that same string: Gemma 4's
+    ``assistant_shared_kv`` (the assistant reads the shared KV carried in
+    ``extra_state``; there is no committed MTP-history cache). Until PR #283
+    every server put site banked Gemma 4 under the Qwen strings while the
+    backend restored under its own, so no Gemma 4 turn ever restored warm.
     """
+    declared = str(
+        getattr(getattr(state, "backend_descriptor", None), "mtp_history_policy", "")
+        or ""
+    )
+    if declared and declared != "committed":
+        return declared
     runtime = getattr(state, "runtime", None)
     return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
 
@@ -21204,9 +21787,15 @@ def _history_ids_for_postcommit(
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     session_committed_ids: Sequence[int] | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> tuple[list[int], Any]:
     """Retokenized next-turn history ids, plus a VisionSplice when the
     history carries images.
+
+    ``timing`` (caller-owned dict) receives the wall of each phase --
+    flatten_s, canonicalize_s, committed_decode_s, render_encode_s,
+    vision_splice_s -- plus vision_images and the embed-cache hit/miss
+    counts, so a slow generation-final commit names its phase (#487).
 
     Image content parts flatten to vision placeholders exactly like the
     live request path, and the resulting single pad tokens are expanded to
@@ -21239,12 +21828,16 @@ def _history_ids_for_postcommit(
             tool_calls=assistant_tool_calls,
         ),
     ]
+    phase_started = time.perf_counter()
     try:
         history_messages, postcommit_vision_images = _vision_extract_and_flatten(
             history_messages
         )
     except ValueError:
         return [], None
+    phase_started = _record_phase(timing, "flatten_s", phase_started)
+    if timing is not None:
+        timing["vision_images"] = len(postcommit_vision_images)
     postcommit_transcript_stats: Any | None = None
     if tool_specs:
         # The generation prompt may compact the current large read as an
@@ -21270,6 +21863,7 @@ def _history_ids_for_postcommit(
             == _POSTCOMMIT_SENTINEL_CONTENT
         ):
             history_messages = history_messages[:-1]
+    phase_started = _record_phase(timing, "canonicalize_s", phase_started)
     # Committed-think substitution for the postcommit (audit F11 #3, the
     # issue #269 bug): the banked next-turn prefix must be built from the
     # SAME canonical encoding the next request will actually send. The next
@@ -21300,7 +21894,10 @@ def _history_ids_for_postcommit(
         except Exception:
             committed_text = ""
         if committed_text:
-            committed_turns = _committed_assistant_turns(committed_text)
+            committed_gemma4 = _reasoning_parser_for_state(state) == "gemma4"
+            committed_turns = _committed_assistant_turns(
+                committed_text, gemma4=committed_gemma4
+            )
             # F11 #3 follow-up (founder-session receipt 2026-08-21): the
             # request-local stream renders an EMPTY think interior for any
             # history turn the committed-reasoning gate could not
@@ -21317,7 +21914,9 @@ def _history_ids_for_postcommit(
                 except Exception:
                     session_text = ""
                 if session_text:
-                    session_turns = _committed_assistant_turns(session_text)
+                    session_turns = _committed_assistant_turns(
+                        session_text, gemma4=committed_gemma4
+                    )
                     committed_turns = [
                         (
                             session_turns[index]
@@ -21352,6 +21951,7 @@ def _history_ids_for_postcommit(
         history_messages = [
             _scrub_inbound_committed_reasoning(message) for message in history_messages
         ]
+    phase_started = _record_phase(timing, "committed_decode_s", phase_started)
     next_turn_prefix_ids = _postcommit_next_turn_prefix_ids(
         state.runtime.tokenizer,
         history_messages,
@@ -21380,15 +21980,42 @@ def _history_ids_for_postcommit(
         # silently drops them and the prefix stops extending the session.
         allow_committed_reasoning=True,
     )
+    phase_started = _record_phase(timing, "render_encode_s", phase_started)
     if not postcommit_vision_images or not history_ids:
         return list(history_ids or []), None
     try:
         expanded_ids, history_splice = _materialize_vision_splice(
-            state, postcommit_vision_images, list(history_ids)
+            state, postcommit_vision_images, list(history_ids), timing=timing
         )
     except Exception:
         return [], None
+    finally:
+        _record_phase(timing, "vision_splice_s", phase_started)
     return expanded_ids, history_splice
+
+
+def _record_phase(
+    timing: dict[str, Any] | None, key: str, started: float
+) -> float:
+    """Store ``now - started`` under ``key`` (when timing is on); return now."""
+    now = time.perf_counter()
+    if timing is not None:
+        timing[key] = round(now - started, 6)
+    return now
+
+
+def _callable_accepts_keyword(fn: Any, name: str) -> bool:
+    """True when ``fn(..., name=...)`` is accepted (explicit or **kwargs)."""
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _generation_final_postcommit_compatibility(
@@ -21405,6 +22032,7 @@ def _generation_final_postcommit_compatibility(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Tool-call turns are no longer refused a priori (the retired
     # "tool_call_history_rewrite" gate): the byte-compare below is the real
@@ -21423,12 +22051,6 @@ def _generation_final_postcommit_compatibility(
             "safe": False,
             "mode": "unsafe",
             "reason": "stats_footer_in_assistant_history",
-        }
-    if _reasoning_parser_for_state(state) == "gemma4" and thinking_enabled:
-        return {
-            "safe": False,
-            "mode": "unsafe",
-            "reason": "gemma4_reasoning_history_retokenize",
         }
     final_state = generated.get("_final_state")
     if final_state is None:
@@ -21459,6 +22081,7 @@ def _generation_final_postcommit_compatibility(
     final_token_ids = [int(token) for token in prompt_ids] + final_generated_tokens
     if not final_token_ids:
         return {"safe": False, "mode": "unsafe", "reason": "empty_generation_boundary"}
+    history_started = time.perf_counter()
     history_ids, history_vision_splice = _history_ids_for_postcommit(
         state,
         messages=messages,
@@ -21483,7 +22106,9 @@ def _generation_final_postcommit_compatibility(
             if session is not None
             else None
         ),
+        timing=timing,
     )
+    _record_phase(timing, "history_s", history_started)
 
     def _bank_view(token_ids: list[int]) -> list[int] | None:
         """Content-keyed ids for the bank; identity for text histories."""
@@ -21516,6 +22141,36 @@ def _generation_final_postcommit_compatibility(
                 "token_ids": bank_ids,
                 "history_suffix_tokens": len(history_ids) - len(final_token_ids),
             }
+    if _committed_token_splice_enabled():
+        spliced_history, splice_receipt = _splice_committed_token_ids(
+            history_ids, final_token_ids, state.runtime.tokenizer
+        )
+        if splice_receipt.get("spans"):
+            if spliced_history == final_token_ids:
+                bank_ids = _bank_view(final_token_ids)
+                if bank_ids is not None:
+                    return {
+                        "safe": True,
+                        "mode": "generation_final_exact",
+                        "reason": "token_identical_after_splice",
+                        "token_ids": bank_ids,
+                        "history_suffix_tokens": 0,
+                        "token_splice": splice_receipt,
+                    }
+            if (
+                len(spliced_history) >= len(final_token_ids)
+                and spliced_history[: len(final_token_ids)] == final_token_ids
+            ):
+                bank_ids = _bank_view(final_token_ids)
+                if bank_ids is not None:
+                    return {
+                        "safe": True,
+                        "mode": "generation_final_prefix",
+                        "reason": "generation_boundary_prefix_of_history_after_splice",
+                        "token_ids": bank_ids,
+                        "history_suffix_tokens": len(spliced_history) - len(final_token_ids),
+                        "token_splice": splice_receipt,
+                    }
     reason = "retokenized_history_mismatch"
     divergence = _first_divergence(final_token_ids, history_ids)
     _dump_postcommit_mismatch(
@@ -21612,6 +22267,99 @@ def _dump_postcommit_mismatch(
         pass
 
 
+def _bank_backend_id(state: ServerState) -> str:
+    """The backend whose restore side the bank identity strings must match."""
+    return str(
+        getattr(getattr(state, "backend_descriptor", None), "backend_id", "")
+        or getattr(getattr(state, "runtime", None), "backend_id", "")
+    )
+
+
+def _generation_final_bank_metadata(
+    state: ServerState,
+    final_state: Any,
+    *,
+    token_count: int,
+) -> dict[str, Any]:
+    """Bank identity and MTP-history payload for a generation-final put.
+
+    One identity per runtime, the one its restore side asks for: Gemma 4
+    restores its pre-norm hidden state under ``gemma4_pre_norm`` and carries
+    no committed MTP history (its assistant reads the shared KV in
+    ``extra_state``); every other runtime banks ``post_norm``. The history
+    policy is never a literal here: ``_bank_history_policy`` is the one
+    answer per runtime (#465 -- an AR-only runtime banks under ``cycle`` and
+    is looked up under ``cycle``).
+    """
+    backend_id = _bank_backend_id(state)
+    committed_mtp_cache = getattr(final_state, "final_committed_mtp_cache", None)
+    mtp_snapshot = (
+        snapshot_cache(committed_mtp_cache) if committed_mtp_cache is not None else None
+    )
+    return {
+        "hidden_variant": (
+            "gemma4_pre_norm" if backend_id == GEMMA4_BACKEND else "post_norm"
+        ),
+        "mtp_history_policy": _bank_history_policy(state),
+        "mtp_history_snapshot": mtp_snapshot,
+        "mtp_snapshot_epoch": token_count if mtp_snapshot is not None else None,
+    }
+
+
+def _generation_final_prompt_boundary_available(
+    state: ServerState,
+    final_state: Any,
+) -> bool:
+    backend_id = _bank_backend_id(state)
+    return bool(
+        backend_id == GEMMA4_BACKEND
+        and getattr(final_state, "prompt_boundary_cache", None) is not None
+        and getattr(final_state, "prompt_boundary_logits", None) is not None
+        and getattr(final_state, "prompt_boundary_hidden", None) is not None
+        and isinstance(
+            getattr(final_state, "prompt_boundary_extra_state", None),
+            dict,
+        )
+    )
+
+
+def _generation_final_bank_commit_safe(state: ServerState, final_state: Any) -> bool:
+    return bool(
+        getattr(final_state, "safe_to_commit", False)
+        or _generation_final_prompt_boundary_available(state, final_state)
+    )
+
+
+def _generation_final_bank_values(
+    state: ServerState,
+    final_state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+) -> dict[str, Any]:
+    backend_id = _bank_backend_id(state)
+    prompt_cache = getattr(final_state, "prompt_boundary_cache", None)
+    if backend_id == GEMMA4_BACKEND and prompt_cache is not None:
+        return {
+            "token_ids": [int(token) for token in prompt_ids],
+            "cache": prompt_cache,
+            "logits": getattr(final_state, "prompt_boundary_logits", None),
+            "hidden": getattr(final_state, "prompt_boundary_hidden", None),
+            "extra_state": getattr(
+                final_state,
+                "prompt_boundary_extra_state",
+                None,
+            ),
+        }
+    return {
+        "token_ids": [int(token) for token in final_token_ids],
+        "cache": final_state.final_trunk_cache,
+        "logits": final_state.final_logits,
+        "hidden": final_state.final_hidden,
+        "extra_state": getattr(final_state, "extra_state", None),
+    }
+
+
 def _store_generation_final_history_snapshot(
     state: ServerState,
     *,
@@ -21642,6 +22390,11 @@ def _store_generation_final_history_snapshot(
                 session = peek(session_id)
             except Exception:
                 session = None
+    # Phase receipts (#487): a commit that normally takes 0.2 s took 20-25 s
+    # four times in one day on a 110-150k vision agent session, and the
+    # single elapsed_s could not say whether the history render, the
+    # vision tower, the tokenizer, or the bank put was the slow half.
+    timing: dict[str, Any] = {}
     started = time.perf_counter()
     compatibility = _generation_final_postcommit_compatibility(
         state,
@@ -21656,13 +22409,21 @@ def _store_generation_final_history_snapshot(
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         session=session,
+        timing=timing,
     )
-    if not bool(compatibility.get("safe")):
+    _record_phase(timing, "compat_s", started)
+    final_state = generated.get("_final_state")
+    prompt_boundary_safe = bool(
+        final_state is not None
+        and _generation_final_prompt_boundary_available(state, final_state)
+    )
+    if not bool(compatibility.get("safe")) and not prompt_boundary_safe:
         outcome = {
             "stored": False,
             "mode": compatibility.get("mode", "unsafe"),
             "reason": compatibility.get("reason", "unsafe_history"),
             "elapsed_s": time.perf_counter() - started,
+            "timing": timing,
         }
         for key in ("history_tokens", "generation_boundary_tokens"):
             if key in compatibility:
@@ -21676,40 +22437,55 @@ def _store_generation_final_history_snapshot(
         # was refused every time.
         _flight(state).pc(session_id, {"action": "generation_final", **outcome})
         return outcome
-    final_state = generated["_final_state"]
-    token_ids = [int(token) for token in compatibility["token_ids"]]
+    bank_values = _generation_final_bank_values(
+        state,
+        final_state,
+        prompt_ids=prompt_ids,
+        final_token_ids=compatibility.get("token_ids") or prompt_ids,
+    )
+    token_ids = bank_values.pop("token_ids")
+    lock_started = time.perf_counter()
     acquired = state.lock.acquire(blocking=False)
+    _record_phase(timing, "lock_wait_s", lock_started)
     if not acquired:
         return {
             "stored": False,
             "mode": "unsafe",
             "reason": "model_lock_busy_before_generation_final_commit",
             "elapsed_s": time.perf_counter() - started,
+            "timing": timing,
         }
     try:
-        mtp_snapshot = (
-            snapshot_cache(final_state.final_committed_mtp_cache)
-            if final_state.final_committed_mtp_cache is not None
-            else None
+        phase_started = time.perf_counter()
+        bank_metadata = _generation_final_bank_metadata(
+            state,
+            final_state,
+            token_count=len(token_ids),
         )
-        entry = state.sessions.bank.put(
+        phase_started = _record_phase(timing, "mtp_snapshot_s", phase_started)
+        bank = state.sessions.bank
+        put_kwargs: dict[str, Any] = dict(
             runtime=state.runtime,
             token_ids=token_ids,
-            cache=final_state.final_trunk_cache,
-            logits=final_state.final_logits,
-            hidden=final_state.final_hidden,
-            hidden_variant="post_norm",
             keep_live_ref=bool(keep_live_ref),
             session_id=session_id,
             template_hash=state.template_hash,
-            mtp_history_policy=_bank_history_policy(state),
             draft_head_identity=state.draft_head_identity,
             policy_fingerprint=policy_fingerprint,
-            mtp_history_snapshot=mtp_snapshot,
             snapshot_epoch=len(token_ids),
-            mtp_snapshot_epoch=len(token_ids) if mtp_snapshot is not None else None,
-            extra_state=getattr(final_state, "extra_state", None),
+            **bank_values,
+            **bank_metadata,
         )
+        # The bank's own per-phase receipt (trunk snapshot, entry build,
+        # cold-tier dispatch, settle dispatch); test doubles without the
+        # keyword keep their exact contract.
+        put_timing: dict[str, Any] = {}
+        if _callable_accepts_keyword(bank.put, "timing_out"):
+            put_kwargs["timing_out"] = put_timing
+        entry = bank.put(**put_kwargs)
+        _record_phase(timing, "put_s", phase_started)
+        if put_timing:
+            timing["put"] = put_timing
     finally:
         state.lock.release()
     if entry is None:
@@ -21718,19 +22494,39 @@ def _store_generation_final_history_snapshot(
             "mode": compatibility["mode"],
             "reason": "sessionbank_snapshot_skipped",
             "elapsed_s": time.perf_counter() - started,
+            "timing": timing,
         }
         _flight(state).pc(session_id, {"action": "generation_final", **outcome})
         return outcome
     outcome = {
         "stored": True,
-        "mode": compatibility["mode"],
-        "reason": compatibility["reason"],
+        "mode": (
+            "generation_prompt_boundary"
+            if prompt_boundary_safe
+            else compatibility["mode"]
+        ),
+        "reason": (
+            (
+                "prompt_boundary_retained"
+                if compatibility.get("safe")
+                else "prompt_boundary_before_unsafe_history"
+            )
+            if prompt_boundary_safe
+            else compatibility["reason"]
+        ),
         "prefix_len": entry.prefix_len,
         "nbytes": entry.nbytes,
         "elapsed_s": time.perf_counter() - started,
-        "history_suffix_tokens": int(compatibility.get("history_suffix_tokens") or 0),
+        "history_suffix_tokens": (
+            0
+            if prompt_boundary_safe
+            else int(compatibility.get("history_suffix_tokens") or 0)
+        ),
         "token_hash": entry.token_hash,
+        "timing": timing,
     }
+    if "token_splice" in compatibility:
+        outcome["token_splice"] = compatibility["token_splice"]
     _flight(state).pc(session_id, {"action": "generation_final", **outcome})
     return outcome
 
@@ -22628,6 +23424,9 @@ def _finalize_batched_ar_generation(
     envelope["mtp_depth"] = 0
     envelope["verify_calls"] = 0
     envelope["verify_time_s"] = 0.0
+    envelope["accepted_drafts"] = 0
+    envelope["rejected_drafts"] = 0
+    envelope["drafted_tokens"] = 0
     envelope["accepted_by_depth"] = []
     envelope["draft_time_s"] = 0.0
     for key in (
@@ -24663,34 +25462,33 @@ def _run_generation(
             and session_bank is not None
             and session_id is not None
             and final_state is not None
-            and final_state.safe_to_commit
+            and _generation_final_bank_commit_safe(state, final_state)
             and final_commit_prompt_ids is not None
         ):
             final_token_ids = list(final_commit_prompt_ids) + list(out.tokens)
-            mtp_snapshot = (
-                snapshot_cache(final_state.final_committed_mtp_cache)
-                if final_state.final_committed_mtp_cache is not None
-                else None
+            bank_values = _generation_final_bank_values(
+                state,
+                final_state,
+                prompt_ids=final_commit_prompt_ids,
+                final_token_ids=final_token_ids,
+            )
+            bank_token_ids = bank_values.pop("token_ids")
+            bank_metadata = _generation_final_bank_metadata(
+                state,
+                final_state,
+                token_count=len(bank_token_ids),
             )
             session_bank.put(
                 runtime=state.runtime,
-                token_ids=final_token_ids,
-                cache=final_state.final_trunk_cache,
-                logits=final_state.final_logits,
-                hidden=final_state.final_hidden,
-                hidden_variant="post_norm",
+                token_ids=bank_token_ids,
                 keep_live_ref=bool(session_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
-                mtp_history_policy=_bank_history_policy(state),
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
-                mtp_history_snapshot=mtp_snapshot,
-                snapshot_epoch=len(final_token_ids),
-                mtp_snapshot_epoch=len(final_token_ids)
-                if mtp_snapshot is not None
-                else None,
-                extra_state=getattr(final_state, "extra_state", None),
+                snapshot_epoch=len(bank_token_ids),
+                **bank_values,
+                **bank_metadata,
             )
             stats["sessionbank_snapshot_bytes"] = int(
                 getattr(session_bank, "last_put_nbytes", 0) or 0
@@ -24798,6 +25596,9 @@ def _run_generation(
                 "verify_eval_unattributed_time_s",
             ):
                 envelope[key] = 0 if key.endswith(("rows", "windows", "calls")) else 0.0
+            envelope["accepted_drafts"] = 0
+            envelope["rejected_drafts"] = 0
+            envelope["drafted_tokens"] = 0
             envelope["accepted_by_depth"] = []
             envelope["draft_time_s"] = 0.0
         if request_observability:
@@ -26793,6 +27594,7 @@ def _nonstream_chat_message_parts(
     suppress_visible_reasoning: bool = False,
     footer_allowed: bool | None = None,
     recover_unclosed_reasoning: bool = False,
+    suppress_stats_footer: bool = False,
 ) -> tuple[str, str]:
     raw_text = _strip_generated_chat_template_sentinels(
         str(generated.get("text") or "")
@@ -26916,7 +27718,7 @@ def _nonstream_chat_message_parts(
         reasoning_text = ""
     if footer_allowed is None:
         footer_allowed = bool(getattr(state.args, "stats_footer", False))
-    if not footer_allowed:
+    if suppress_stats_footer or not footer_allowed:
         return display_text, reasoning_text
     footer = _stats_footer_text(state, generated)
     if not footer:
@@ -29049,7 +29851,10 @@ def create_app(state: ServerState) -> FastAPI:
         server_url = str(request.base_url).rstrip("/")
         return {
             "ok": True,
-            "name": "MTPLX OpenAI-compatible API",
+            "name": (
+                "MTPLX OpenAI-compatible API "
+                "(client function/custom/namespace Responses subset)"
+            ),
             "model": state.model_id,
             "message": "Do not use this as a browser chat page. Paste this URL into Open WebUI Settings > Connections as the OpenAI API Base URL.",
             "mtplx_api_base_url": f"{server_url}/v1",
@@ -29064,6 +29869,7 @@ def create_app(state: ServerState) -> FastAPI:
             "endpoints": {
                 "models": f"{server_url}/v1/models",
                 "chat_completions": f"{server_url}/v1/chat/completions",
+                "responses": f"{server_url}/v1/responses",
                 "health": f"{server_url}/health",
             },
         }
@@ -30346,6 +31152,11 @@ def create_app(state: ServerState) -> FastAPI:
             for descriptor in retrieval.descriptors():
                 if descriptor["role"] != wanted:
                     continue
+                # Never advertise a model the daemon cannot load. Startup
+                # refuses unresolvable references, so this covers the case
+                # startup cannot: a checkpoint deleted while the daemon runs.
+                if not descriptor.get("resolved", True):
+                    continue
                 entries.append(
                     {
                         "id": descriptor["id"],
@@ -30580,6 +31391,7 @@ def create_app(state: ServerState) -> FastAPI:
         # its closures read exactly as before the extraction.
         opencode_client = policy.opencode_client
         tool_specs = policy.tool_specs
+        prompt_tool_specs = policy.prompt_tool_specs
         tools_active = policy.tools_active
         agent_transcript_tools_active = policy.agent_transcript_tools_active
         read_only_force_answer_contract_active = (
@@ -30690,7 +31502,7 @@ def create_app(state: ServerState) -> FastAPI:
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
             preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
-            tools=tool_specs if tools_active else None,
+            tools=prompt_tool_specs,
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
@@ -30784,7 +31596,7 @@ def create_app(state: ServerState) -> FastAPI:
                 request=request,
                 thinking_enabled=thinking_enabled,
                 reasoning_effort=reasoning_effort,
-                tools=tool_specs if tools_active else None,
+                tools=prompt_tool_specs,
                 tool_choice=request.tool_choice,
                 tool_prompt_mode=template_tool_prompt_mode,
                 template_observability=template_observability,
@@ -30798,9 +31610,16 @@ def create_app(state: ServerState) -> FastAPI:
             if _canonicalized is not None:
                 messages_for_generation, prompt_ids = _canonicalized
         if vision_images:
+            # Off the event loop (#487): the tower forwards for every image
+            # of the prompt ran inside this coroutine, so a history whose
+            # screenshots missed the embed cache froze the whole server --
+            # /health included -- for as long as the tower took. The
+            # embeddings are evaluated before they cross threads, exactly
+            # as before; only the thread doing the work changes (the same
+            # to_thread pattern the non-stream generation path uses).
             try:
-                prompt_ids, vision_splice = _materialize_vision_splice(
-                    state, vision_images, prompt_ids
+                prompt_ids, vision_splice = await asyncio.to_thread(
+                    _materialize_vision_splice, state, vision_images, prompt_ids
                 )
             except ValueError as vision_error:
                 raise HTTPException(status_code=400, detail=str(vision_error))
@@ -30878,7 +31697,7 @@ def create_app(state: ServerState) -> FastAPI:
             thinking_enabled=thinking_enabled,
             generation_mode=request_generation_mode,
             depth=effective_request_depth,
-            tools_active=tools_active,
+            tools_active=bool(prompt_tool_specs),
             tool_prompt_mode=tool_prompt_mode,
             tool_choice=request.tool_choice,
             no_tools_contract_active=no_tools_contract_active,
@@ -30903,11 +31722,7 @@ def create_app(state: ServerState) -> FastAPI:
                 thinking_enabled=thinking_enabled,
                 generation_mode=request_generation_mode,
                 depth=effective_request_depth,
-                tools_active=(
-                    bool(postcommit_tool_specs)
-                    if read_only_force_answer_contract_active
-                    else tools_active
-                ),
+                tools_active=bool(postcommit_tool_specs),
                 tool_prompt_mode=(
                     postcommit_tool_prompt_mode
                     if read_only_force_answer_contract_active
@@ -31210,6 +32025,11 @@ def create_app(state: ServerState) -> FastAPI:
         def _nonstream_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
+            # The flight recorder learned about tokens only from the SSE
+            # drain loop, so a non-streaming request decoding 24,000 tokens
+            # showed as "prefill, 0 tokens, 0 tok/s" on /v1/mtplx/flight and
+            # the dashboard for its whole life. Same hook, same clock.
+            _flight(state).on_tokens(response_id, len(new_tokens), time.perf_counter())
             cancel_message = (
                 "client disconnected"
                 if nonstream_client_disconnected
@@ -31372,6 +32192,24 @@ def create_app(state: ServerState) -> FastAPI:
                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 session=session,
             )
+            final_state = generated.get("_final_state")
+            if final_state is not None and _generation_final_prompt_boundary_available(
+                state,
+                final_state,
+            ):
+                generated["stats"]["session_postcommit_snapshot"] = {
+                    "stored": True,
+                    "mode": "generation_prompt_boundary",
+                    "reason": (
+                        "prompt_boundary_retained"
+                        if compatibility.get("safe")
+                        else "prompt_boundary_before_unsafe_history"
+                    ),
+                    "prefix_len": len(prompt_ids),
+                    "elapsed_s": time.perf_counter() - started,
+                    "history_suffix_tokens": 0,
+                }
+                return
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
                     "stored": True,
@@ -32879,6 +33717,19 @@ def create_app(state: ServerState) -> FastAPI:
                             if status_code == 507
                             else type(exc).__name__
                         )
+                    elif _is_non_finite_logits(exc):
+                        try:
+                            _failed_session = session_id
+                        except NameError:  # lane without a session binding
+                            _failed_session = None
+                        message = _non_finite_logits_failure(
+                            state,
+                            exc,
+                            request_id=response_id,
+                            session_id=_failed_session,
+                        )
+                        status_code = 500
+                        error_code = "non_finite_logits"
                     else:
                         message = str(exc)
                         status_code = 500
@@ -34430,7 +35281,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 if _stats_footer_allowed(state, headers, metadata)
                                 else ""
                             )
-                            if footer and not assistant_tool_calls:
+                            if (
+                                footer
+                                and not assistant_tool_calls
+                                and not request.suppress_stats_footer
+                            ):
                                 # The footer is server-injected, not model
                                 # output: bypass stop monitoring so a stop
                                 # string like "\n\n" can neither suppress it
@@ -34976,6 +35831,7 @@ def create_app(state: ServerState) -> FastAPI:
                         str(generated.get("finish_reason") or "") == "stop"
                         and not tools_active
                     ),
+                    suppress_stats_footer=request.suppress_stats_footer,
                 )
                 if extraction is None:
                     # No tools were declared on this request, so any tool-call
@@ -35046,6 +35902,69 @@ def create_app(state: ServerState) -> FastAPI:
             }
         )
 
+    @app.post("/v1/responses")
+    async def responses(
+        raw_request: Request, request: responses_api.ResponsesRequest
+    ) -> Any:
+        """Translate the local, stateless client-tool Responses subset.
+
+        The chat endpoint remains the sole owner of prompt rendering, sampling,
+        tool parsing, session/cache policy, and cancellation.  This adapter is
+        intentionally not a second inference path.
+
+        Server-hosted tools are rejected because accepting them would tell
+        Codex a tool can run when this local daemon cannot execute it.
+        """
+
+        try:
+            conversion = responses_api.translate_request(request)
+        except responses_api.ResponsesProtocolError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Responses API: {exc}"
+            ) from exc
+        chat_data = dict(conversion.chat)
+        chat_messages = chat_data.pop("messages")
+        chat_request = ChatCompletionRequest(
+            messages=[ChatMessage.model_validate(message) for message in chat_messages],
+            **chat_data,
+        )
+        response_id = "resp_" + uuid.uuid4().hex
+        chat_response = await chat_completions(raw_request, chat_request)
+        if not isinstance(chat_response, (JSONResponse, StreamingResponse)):
+            return chat_response
+        if chat_response.status_code >= 400:
+            return chat_response
+        if request.stream:
+            if not isinstance(chat_response, StreamingResponse):
+                return chat_response
+            return StreamingResponse(
+                responses_api.stream_from_chat_sse(
+                    chat_response.body_iterator,
+                    response_id=response_id,
+                    model=state.model_id,
+                    response_fields=conversion.response_fields,
+                    custom_tool_names=conversion.custom_tool_names,
+                    namespace_functions=conversion.namespace_functions,
+                ),
+                media_type="text/event-stream",
+            )
+        if not isinstance(chat_response, JSONResponse):
+            return chat_response
+        try:
+            chat_payload = json.loads(chat_response.body)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"failed to translate chat response: {exc}"
+            ) from exc
+        payload = responses_api.payload_from_chat(
+            chat_payload,
+            response_id=response_id,
+            response_fields=conversion.response_fields,
+            custom_tool_names=conversion.custom_tool_names,
+            namespace_functions=conversion.namespace_functions,
+        )
+        return JSONResponse(payload, status_code=chat_response.status_code)
+
     @app.post("/v1/messages")
     async def anthropic_messages(
         raw_request: Request, request: AnthropicMessagesRequest
@@ -35110,7 +36029,7 @@ def create_app(state: ServerState) -> FastAPI:
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
             preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
-            tools=policy.tool_specs if policy.tools_active else None,
+            tools=policy.prompt_tool_specs,
             tool_choice=chat_request.tool_choice,
             tool_prompt_mode=policy.tool_prompt_mode,
         )
@@ -35761,6 +36680,16 @@ def create_app(state: ServerState) -> FastAPI:
                 ),
             )
         request_id = uuid.uuid4().hex[:12]
+        if _is_non_finite_logits(exc):
+            # Non-streaming lanes: the same truthful failure the streaming
+            # error frame reports (session id is not known here).
+            message = _non_finite_logits_failure(state, exc, request_id=request_id)
+            return JSONResponse(
+                status_code=500,
+                content=_openai_error_content(
+                    message, status_code=500, code="non_finite_logits"
+                ),
+            )
         # Full detail belongs in the server log, not the wire: exception
         # class + repr in client bodies got quoted verbatim by external
         # endpoint probes as "MTPLX python errors" (2026-08-05 showdown).
@@ -36196,6 +37125,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Model cache directory used to resolve retrieval references",
     )
     parser.add_argument(
+        "--retrieval-model-root",
+        dest="retrieval_model_roots",
+        action="append",
+        default=None,
+        help="Additional read-only model library root; repeat for ordered lookup",
+    )
+    parser.add_argument(
         "--retrieval-trust-remote-code",
         action="store_true",
         help=(
@@ -36257,7 +37193,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Let browser pages served from this origin (for example "
-            "http://localhost:5173) call the API with credentials. Repeatable; "
+            "http://localhost:5173, or tauri://localhost for a desktop web "
+            "view) call the API with credentials. Repeatable; "
             "MTPLX_CORS_ORIGINS takes a comma-separated list. Pages MTPLX serves "
             "itself are always allowed, every other origin is refused, and "
             "/admin routes stay same-origin only."
@@ -37008,6 +37945,27 @@ def _start_aime_parent_watchdog_from_env() -> None:
     ).start()
 
 
+def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
+    """Refuse to start when a configured retrieval model is not on disk.
+
+    Retrieval references stay symbolic until the server resolves them, so this
+    is the one place where --embedding-model / --reranker-model can be held to
+    the same "resolve it or do not start" contract the chat model already has.
+    The loader's own message is passed through verbatim: it carries the
+    `mtplx pull <repo>` hint the user needs.
+    """
+
+    failures = registry.unresolved() if registry is not None else []
+    if not failures:
+        return
+    flags = {"embedding": "--embedding-model", "rerank": "--reranker-model"}
+    lines = [
+        f"{flags.get(spec.role, spec.role)} {spec.model_ref}: {reason}"
+        for spec, reason in failures
+    ]
+    raise RetrievalError("\n".join(lines))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
@@ -37015,7 +37973,7 @@ def main(argv: list[str] | None = None) -> None:
     _start_aime_parent_watchdog_from_env()
     try:
         state = ServerState(args)
-    except A3BMTPBatchInstallError as exc:
+    except (A3BMTPBatchInstallError, RetrievalError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
     app = create_app(state)

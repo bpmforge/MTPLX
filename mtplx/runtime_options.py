@@ -285,11 +285,11 @@ def qwen4_verify_glue_enabled(item: str | None = None) -> bool:
 
 
 def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
-    """Force the verify-glue gates from a given environment.  Tests only.
+    """Re-read the verify-glue gates from the environment.
 
-    The runtime reads these at use and never calls this; it exists so a test
-    can arm one item without a subprocess by FORCING the module globals (which
-    then win over the environment until reset again).
+    The hot path reads these once at import on purpose; this exists so a test
+    can arm one item without a subprocess, and so :func:`refresh_env_flags`
+    can re-read them once the server has installed the model's runtime env.
     """
 
     global _QWEN4_VERIFY_GLUE, _QWEN4_VERIFY_GLUE_SELECTED
@@ -507,6 +507,50 @@ def qsa_sparse_decode_splits() -> int:
         os.environ.get("MTPLX_QSA_SPARSE_DECODE_SPLITS")
         or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
     )
+
+def reset_qwen4_opdiet_cache(env: Mapping[str, str] | None = None) -> None:
+    """Re-read the op-diet gates from the environment (see :func:`refresh_env_flags`)."""
+
+    global _QWEN4_OPDIET, _QWEN4_OPDIET_SELECTED
+    source = os.environ if env is None else env
+    _QWEN4_OPDIET = env_bool("MTPLX_QWEN4_OPDIET", default=False, env=source)
+    _QWEN4_OPDIET_SELECTED = parse_opdiet_items(source.get("MTPLX_QWEN4_OPDIET_ITEMS"))
+
+
+def refresh_env_flags(env: Mapping[str, str] | None = None) -> dict[str, bool]:
+    """Re-read every import-frozen runtime flag from ``env`` (default ``os.environ``).
+
+    Some hot-path gates are read once at import so decode never touches
+    ``os.environ`` and two traces of one compiled graph cannot disagree:
+    ``MTPLX_QWEN4_OPDIET``, ``MTPLX_QWEN4_VERIFY_GLUE``,
+    ``MTPLX_QWEN4_DRAFT_K20_PRESCATTER`` and ``MTPLX_QWEN4_BLOCK_VERIFY``, plus
+    ``generation``'s copies of the last two. ``mtplx serve`` imports those
+    modules before ``ServerState`` stamps the model family's runtime env
+    (the Flash-Next lane defaults arm all four), so until 2026-09-08 a served
+    daemon reported the keys as configured while running with every one of
+    them off (PR #475 by davidtai found the same four frozen readers).
+    ``profiles.apply_profile_env`` calls this after it writes ``os.environ``,
+    which is before any model load, so the traces-agree invariant holds:
+    nothing has been compiled yet. Returns the live values as a receipt.
+    """
+
+    import sys
+
+    reset_qwen4_opdiet_cache(env)
+    reset_qwen4_verify_glue_cache(env)
+    from . import qwen4_block_verify, qwen4_draft_k20_prescatter
+
+    block_verify = qwen4_block_verify.refresh_from_env(env)
+    prescatter = qwen4_draft_k20_prescatter.refresh_from_env(env)
+    generation = sys.modules.get("mtplx.generation")
+    if generation is not None and hasattr(generation, "refresh_env_flags"):
+        generation.refresh_env_flags()
+    return {
+        "MTPLX_QWEN4_OPDIET": bool(_QWEN4_OPDIET),
+        "MTPLX_QWEN4_VERIFY_GLUE": bool(_QWEN4_VERIFY_GLUE),
+        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER": bool(prescatter),
+        "MTPLX_QWEN4_BLOCK_VERIFY": bool(block_verify),
+    }
 
 
 @dataclass(frozen=True)

@@ -991,14 +991,22 @@ struct ResolvedDaemonArgs {
         // The daemon starts with no depth policy unless told otherwise, so
         // "on" has to name the policy at launch to survive a relaunch. Unset
         // keeps the target's preset: Pi and Hermes name expected_value, the
-        // other targets pass nothing.
+        // other targets pass nothing. Flash-Next is the exception: measured
+        // 2026-09-06 on the shipped 2.11.2 lane, the expected-value policy
+        // decodes 7 to 8 percent slower than a fixed depth 3 at both 2k and
+        // 19k tokens of context (ABBA pairs, the stopped third draft buys
+        // nothing on that family), while the 27B pair is a tie. So an unset
+        // switch launches Flash-Next at the chosen depth for every target,
+        // and the switch still turns the policy on explicitly.
+        let familyKeepsPresetPolicy =
+            MTPLXModelOption.modelFamily(for: configuration.model) != "qwen4_exp"
         switch configuration.adaptiveDepth {
         case .some(false):
             adaptivePolicy = "none"
         case .some(true):
             adaptivePolicy = preset.adaptivePolicy ?? "expected_value"
         case .none:
-            adaptivePolicy = preset.adaptivePolicy
+            adaptivePolicy = familyKeepsPresetPolicy ? preset.adaptivePolicy : nil
         }
         adaptiveMinDepth = preset.adaptiveMinDepth
         adaptiveEVBaseDepth = preset.adaptiveEVBaseDepth
@@ -1421,10 +1429,9 @@ private struct TargetPreset {
                 : defaultOpenCodeSessionBankMaxEntries,
             "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
             "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
-            // Mirrors the CLI coding-agent lane (_opencode_memory_env_defaults);
-            // this key was CLI-only drift until the 2026-08-03 parity audit.
-            "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
-            "MTPLX_LAZY_BONUS_VERIFY": "1",
+            // Model/profile defaults own distribution evaluation and verify
+            // width, as in the CLI. Generic lazy pins mask Flash-Next's
+            // batched fixed-M4 lane; lazy bonus alone also removes its fourth row.
             "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
             "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
             // The read-inspection compactor and force-answer contract are no

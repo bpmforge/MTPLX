@@ -237,6 +237,11 @@ GIB = 1024**3
 # a stale short prefix (#121, measured 2026-07-16). Memory stays bounded by
 # max_bytes; the count cap only bounds scan cost.
 DEFAULT_MAX_ENTRIES = 24
+# Flat fallbacks for a machine whose RAM cannot be detected and that has no
+# memory plan. Every detected machine sizes the bank from the plan
+# (engine_session.resolve_session_bank_max_bytes) and the per-session cap
+# from the plan's play (resolve_session_bank_per_session_bytes), so raising
+# these would only raise the gate on the one machine we know nothing about.
 DEFAULT_MAX_BYTES = 24 * GIB
 DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
@@ -297,6 +302,7 @@ class CacheMissReason(str, Enum):
     SESSION_BUSY = "session_busy"
     SNAPSHOT_DESYNC = "snapshot_desync"
     NO_SNAPSHOT_COVERAGE = "no_snapshot_coverage"
+    OVERSIZED_SNAPSHOT_SKIPPED = "oversized_snapshot_skipped"
 
 
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
@@ -581,6 +587,12 @@ class SessionBank:
         self.last_miss_reason: str | None = None
         self.last_put_nbytes: int = 0
         self.last_put_skipped_oversized_snapshot: bool = False
+        # Sessions whose latest generation-final snapshot was refused for size
+        # (issue #499, 2026-09-16 repro): the next restore of that conversation
+        # names the refusal as the miss instead of the cold tier's prefix miss,
+        # which only says the SSD had nothing either.
+        self._oversized_skips: dict[str | None, dict[str, Any]] = {}
+        self.last_oversized_skip: dict[str, Any] | None = None
         self._oversized_warned_sessions: set[str | None] = set()
         # Bounded: appended on every eviction/skip for the daemon's lifetime;
         # health snapshots only ever read the newest entries, so an unbounded
@@ -631,7 +643,11 @@ class SessionBank:
 
     @property
     def total_nbytes(self) -> int:
-        return sum(entry.nbytes for entry in self._entries.values())
+        # Snapshot the values: /health reads this from a server thread while
+        # the model owner mutates the dict inside put() (#487 -- a
+        # "dictionary changed size during iteration" 500 counts as a
+        # watchdog miss in the app). list() of a dict is atomic under the GIL.
+        return sum(entry.nbytes for entry in list(self._entries.values()))
 
     def effective_max_bytes(self) -> int:
         """The byte budget in force right now.
@@ -683,7 +699,9 @@ class SessionBank:
             return set()
         cutoff = time.monotonic() - self.active_pin_ttl_s
         return {
-            sid for sid, ts in self._session_last_active.items() if ts >= cutoff
+            sid
+            for sid, ts in list(self._session_last_active.items())
+            if ts >= cutoff
         }
 
     def warn_oversized_snapshot_skip(
@@ -877,6 +895,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(nbytes_override))
             return None
         lazy_kv = _lazy_snapshot_enabled()
         trunk_snapshot_started = time.perf_counter()
@@ -970,6 +989,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(entry_nbytes))
             return None
         entry = SessionBankEntry(
             token_ids=tokens,
@@ -1062,6 +1082,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(entry_nbytes))
             return None
         snapshot = CacheSnapshot(
             states=tuple(_clone_tree(item) for item in cache_snapshot.states),
@@ -1520,6 +1541,46 @@ class SessionBank:
         setattr(entry, "ssd_restore_s", float(getattr(record, "restore_s", 0.0) or 0.0))
         return entry, matched
 
+    def _record_oversized_skip(
+        self, session_id: str | None, tokens: tuple[int, ...] | list[int], nbytes: int
+    ) -> None:
+        record = {
+            "session_id": session_id,
+            "prefix_len": len(tokens),
+            "token_hash": token_prefix_hash(tokens),
+            "nbytes": int(nbytes),
+            "budget": int(self.per_session_max_bytes),
+            "at_s": time.time(),
+        }
+        self._oversized_skips[session_id] = record
+        self.last_oversized_skip = dict(record)
+
+    def _oversized_skip_covering(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> dict[str, Any] | None:
+        record = self._oversized_skips.get(session_id)
+        if record is None:
+            return None
+        n = int(record["prefix_len"])
+        tokens = tuple(int(token) for token in token_ids)
+        if len(tokens) < n or token_prefix_hash(tokens[:n]) != record["token_hash"]:
+            return None
+        return record
+
+    def _note_oversized_miss(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> bool:
+        """A miss on a conversation whose snapshot was refused for size is
+        reported as that refusal, not as the cold tier's prefix miss."""
+        record = self._oversized_skip_covering(session_id, token_ids)
+        if record is None:
+            return False
+        self.last_miss_reason = CacheMissReason.OVERSIZED_SNAPSHOT_SKIPPED.value
+        if self.last_prefix_diagnostic is not None:
+            self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
+            self.last_prefix_diagnostic["oversized_skip"] = dict(record)
+        return True
+
     def restore(
         self,
         runtime: MTPLXRuntime,
@@ -1703,18 +1764,21 @@ class SessionBank:
         # restore must land on a token where the recurrent state is *known*,
         # not merely where the KV can trim. Restoring KV to `matched` while
         # recurrent state stays at the stored end silently degrades answers
-        # (Desktop QA, pre-v2). Tiny gaps (<= near-prefix gap limit) keep the
-        # long-shipped tokenizer-drift tolerance; anything larger requires a
-        # stored boundary <= matched and restores there instead, with the
-        # caller re-prefilling (boundary, prompt_end].
+        # (Desktop QA, pre-v2). The attention KV can be trimmed exactly for
+        # any gap; the GDN/conv state cannot be trimmed at all, so on a
+        # recurrent entry EVERY partial restore -- including the 1-8 token
+        # "tokenizer drift" seams a re-rendered agent turn produces -- must
+        # land on a stored recurrent boundary <= matched, with the caller
+        # re-prefilling (boundary, prompt_end]. Until 2026-09-08 gaps up to
+        # the near-prefix limit kept the KV-only tolerance on hybrid entries
+        # too, which decoded the whole turn on GDN state that had consumed up
+        # to eight tokens the new prompt does not contain plus one token
+        # twice (three audits reproduced it; the tolerance only ever held on
+        # attention-only models, where the trim IS the boundary).
         restore_point = matched
         boundary_snapshot: CacheSnapshot | None = None
         boundary_hidden: Any | None = None
-        gap_from_entry = int(entry.prefix_len) - matched
-        needs_boundary = (
-            bool(entry.has_recurrent)
-            and gap_from_entry > _near_prefix_tiny_gap_limit()
-        )
+        needs_boundary = bool(entry.has_recurrent)
         if needs_boundary:
             boundary = entry.recurrent_boundary_at_or_below(matched)
             if boundary is None:
@@ -1957,6 +2021,7 @@ class SessionBank:
             "entries": len(self._entries),
             "total_nbytes": self.total_nbytes,
             "last_miss_reason": self.last_miss_reason,
+            "last_oversized_skip": self.last_oversized_skip,
             "last_restore_source": self.last_restore_source,
             "last_ssd_restore_s": self.last_ssd_restore_s,
             "last_prefix_diagnostic": self.last_prefix_diagnostic,
@@ -1996,7 +2061,9 @@ class SessionBank:
                         for record in (getattr(entry, "gdn_boundaries", None) or [])
                     ],
                 }
-                for entry in sorted(self._entries.values(), key=lambda item: item.prefix_len)
+                for entry in sorted(
+                    list(self._entries.values()), key=lambda item: item.prefix_len
+                )
             ],
             "eviction_log": list(self.eviction_log)[-16:],
         }
@@ -2408,9 +2475,11 @@ class SessionBank:
         policy_fingerprint: str | None,
     ) -> SessionBankRestore | None:
         if self.cold_tier is None:
+            self._note_oversized_miss(session_id, token_ids)
             return None
         lookup = getattr(self.cold_tier, "lookup", None)
         if not callable(lookup):
+            self._note_oversized_miss(session_id, token_ids)
             return None
         record = lookup(
             token_ids,
@@ -2438,6 +2507,7 @@ class SessionBank:
                 self.last_miss_reason = str(cold_miss)
                 if self.last_prefix_diagnostic is not None:
                     self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
+            self._note_oversized_miss(session_id, token_ids)
             return None
         if hidden_variant is not None and (
             getattr(record, "logits", None) is None

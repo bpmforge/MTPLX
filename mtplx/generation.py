@@ -81,6 +81,7 @@ from .graphbank import (
     _fixed_m4_initial_growth_reserve,
     cache_array_tree,
     compiled_verify_mode,
+    ensure_eager_window_capacity,
     paged_offsets_context_ok as _paged_offsets_context_ok,
     promote_kv_cache_offsets,
     set_paged_offsets_context_ok,
@@ -97,6 +98,8 @@ from .qsa_mtp_precompute import (
 )
 from .runtime import MTPLXRuntime
 from .sampling import (
+    NonFiniteLogitsError,
+    non_finite_logits_error,
     SamplerConfig,
     SparseDistribution,
     acceptance_probability as compute_acceptance_probability,
@@ -326,19 +329,41 @@ def _env_falsey(name: str) -> bool:
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
-#
-# MTPLX_QWEN4_BLOCK_VERIFY -- likewise read AT USE via
-# ``_qwen4_block_verify_enabled()`` (see mtplx.qwen4_block_verify), default OFF,
-# NOT frozen at import (same served-arming reason). The env is frozen once
-# serving starts, so the accept loop reads the same value at every step. When
-# on, the loop runs block verification (Sun et al. 2024, arXiv:2403.10444)
-# instead of the per-token Leviathan-Chen law: it clips the RUNNING reach
-# product at 1 rather than clipping each factor, water-fills the resulting
-# budget across the depth d+1 draft support, and corrects from the SCALED
-# residual (c*p - q)+.  Both laws are exact samplers of the same target
-# distribution; BV accepts deeper more often (+1.85% tokens/window measured
-# offline on 381 real windows) and draws exactly the same number of uniforms.
-# See ``mtplx/qwen4_block_verify.py``.
+_QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
+
+# MTPLX_QWEN4_BLOCK_VERIFY -- read at import (in ``mtplx.qwen4_block_verify``)
+# and re-copied by ``refresh_env_flags`` below once the server has stamped the
+# model family's runtime env, default OFF.  When off this constant is False,
+# no verifier is built, and the stock accept loop evaluates exactly the
+# expressions it evaluated before -- same acceptance probability, same
+# residual, same uniforms, same order.  When on, the loop runs block
+# verification (Sun et al. 2024, arXiv:2403.10444) instead of the per-token
+# Leviathan-Chen law: the reach budget is carried across depths instead of
+# clipping each factor, water-filled across the depth d+1 draft support, and
+# a rejection corrects from the deficit residual.  Both laws are exact
+# samplers of the same target distribution (tests/test_block_verify_exact_law.py
+# enumerates both); BV accepts deeper more often (+1.85% tokens/window
+# measured offline on 381 real windows) and draws exactly the same number of
+# uniforms.  See ``mtplx/qwen4_block_verify.py``.
+_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+
+
+def refresh_env_flags() -> dict[str, bool]:
+    """Re-copy the import-frozen gates from their owning modules.
+
+    ``mtplx.runtime_options.refresh_env_flags`` re-reads the environment in
+    the owning modules and then calls this, so the two constants above track
+    the model family's runtime env the server stamped after this module was
+    imported. Runs before any model load; never on the hot path.
+    """
+
+    global _QWEN4_DRAFT_K20_PRESCATTER, _QWEN4_BLOCK_VERIFY
+    _QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
+    _QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+    return {
+        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER": bool(_QWEN4_DRAFT_K20_PRESCATTER),
+        "MTPLX_QWEN4_BLOCK_VERIFY": bool(_QWEN4_BLOCK_VERIFY),
+    }
 
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
@@ -2800,6 +2825,7 @@ class GenerationStats:
     context_copy_accepted_blocks: int = 0
     context_copy_accepted_tokens: int = 0
     context_copy_suspensions: int = 0
+    context_copy_capacity_growths: int = 0
     context_copy_suspended: bool = False
     context_copy_backoff_tokens: int = 0
     context_copy_disabled_reason: str | None = None
@@ -3111,6 +3137,12 @@ class GenerationFinalState:
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     extra_state: dict[str, Any] | None = None
+    # Optional pre-decode state for backends whose rolling cache cannot safely
+    # reconstruct an earlier prompt boundary from the generated tail.
+    prompt_boundary_cache: list[Any] | None = None
+    prompt_boundary_logits: Any | None = None
+    prompt_boundary_hidden: Any | None = None
+    prompt_boundary_extra_state: dict[str, Any] | None = None
 
 
 def _finish_reason_from_tokens(
@@ -3863,24 +3895,23 @@ def _restore_near_prefix_prompt_state(
             _near_debug("missing_committed_mtp_history")
             continue
         if getattr(entry, "has_recurrent", False):
-            gap_from_entry = int(getattr(entry, "prefix_len", 0) or 0) - matched
-            if gap_from_entry > max_gap:
-                # Boundary-true restores land at the newest recurrent boundary
-                # at/below `matched`, not at `matched` itself. A candidate is
-                # only worth taking when that achievable point still beats the
-                # exact-prefix alternative — otherwise a boundary-quantized
-                # restore silently LOSES tokens vs the plain exact restore
-                # (observed: block candidate matched=2560 restoring at 2354
-                # while an exact 2383-entry existed).
-                probe = getattr(entry, "recurrent_boundary_at_or_below", None)
-                achievable = 0
-                if callable(probe):
-                    boundary_probe = probe(matched)
-                    if boundary_probe is not None:
-                        achievable = int(boundary_probe[0])
-                if achievable <= int(min_restore_tokens):
-                    _near_debug(f"boundary_not_better:{achievable}")
-                    continue
+            # Every partial restore of a recurrent entry lands at the newest
+            # recurrent boundary at/below `matched`, not at `matched` itself
+            # (the GDN state cannot be trimmed; tiny gaps included since
+            # 2026-09-08). A candidate is only worth taking when that
+            # achievable point still beats the exact-prefix alternative --
+            # otherwise a boundary-quantized restore silently LOSES tokens vs
+            # the plain exact restore (observed: block candidate matched=2560
+            # restoring at 2354 while an exact 2383-entry existed).
+            probe = getattr(entry, "recurrent_boundary_at_or_below", None)
+            achievable = 0
+            if callable(probe):
+                boundary_probe = probe(matched)
+                if boundary_probe is not None:
+                    achievable = int(boundary_probe[0])
+            if achievable <= int(min_restore_tokens):
+                _near_debug(f"boundary_not_better:{achievable}")
+                continue
 
         prefix_restore = None
         cache_restore_time_s = 0.0
@@ -5299,45 +5330,89 @@ def _sample_from_logits(
                 config.frequency_penalty,
                 penalty_overlay=penalty_overlay,
             )
-        _eval(logits)
-        return int(mx.argmax(logits, axis=-1).item()), None
+        # argmax of a NaN row is token 0 (``!``); two tiny reductions in the
+        # same eval keep the greedy lane as loud as the sampled one. -inf on
+        # its own is legitimate (grammar masks, penalties); NaN anywhere or a
+        # non-finite maximum (+inf, or every token masked) is the fault.
+        chosen = mx.argmax(logits, axis=-1)
+        bad = mx.logical_or(mx.any(mx.isnan(logits)), mx.isinf(mx.max(logits)))
+        _eval(chosen, bad)
+        if bool(bad.item()):
+            row = np.asarray(logits.astype(mx.float32))
+            raise non_finite_logits_error(row, "greedy argmax")
+        return int(chosen.item()), None
     probs = _distribution_from_mlx_logits(
         logits, config, token_counts=token_counts, penalty_overlay=penalty_overlay
     )
     return sample_from_distribution(probs, rng), probs
 
 
-def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
-    """Device-side shaped sampling (temp -> top-k -> top-p -> categorical)
-    returning a LAZY scalar token array — the pipelined-AR lane's sampler.
+def _mx_lazy_shape(
+    row: mx.array, config: SamplerConfig
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Shape one logits row on device: ``(ids, log_weights, bad)``.
 
-    Shaping is distribution-identical to the CPU sampler; the randomness
-    stream is mx.random keyed from the request seed instead of the numpy
-    generator, so runs stay deterministic per seed but the streams differ.
-    Callers gate on temperature > 0 and 1 < top_k < vocab.
+    ``ids`` are the top-k token ids ranked by value, ``log_weights`` their
+    temperature-scaled logits with the entries outside the nucleus set to
+    -inf (a categorical over ``log_weights`` is the shaped distribution),
+    and ``bad`` a lazy scalar that is true when the row carries NaN or +inf
+    (or is all -inf).
+
+    Shaping is distribution-identical to the CPU sampler
+    (``sampling.apply_top_p_top_k``): the nucleus keeps the ranked top-k
+    entries whose cumulative mass BEFORE them, measured on the softmax over
+    the FULL vocabulary, is below top_p, and the survivors are renormalised
+    for the draw. Until 2026-09-08 the nucleus was measured on the softmax of
+    the k survivors alone; that renormalisation made the mass cross top_p
+    one to five tokens earlier than every other lane at the family's
+    1.0/0.95/20 settings (three audits: 4-5% total variation per token), so
+    Flash-Next AR was sharper than Flash-Next MTP and not a clean control.
 
     The top-k selection runs on the model dtype (half the bytes over the
-    248k vocab); only the k survivors are cast to fp32 for temperature,
-    top-p and the draw — bf16 argpartition ranks by value exactly.
+    248k vocab); only the k survivors are cast to fp32 for temperature and
+    top-p — bf16 argpartition ranks by value exactly. The full row is read
+    once more for the fp32 log-normaliser and the finiteness flag; both are
+    single reductions on a row the model just wrote.
     """
     k = int(config.top_k or 0)
+    inv_temperature = 1.0 / max(float(config.temperature), 1e-6)
     top_idx = mx.argpartition(-row, kth=k - 1)[:k]
-    logits = mx.take(row, top_idx).astype(mx.float32) * (
-        1.0 / max(float(config.temperature), 1e-6)
-    )
-    top_vals = logits
+    top_vals = mx.take(row, top_idx).astype(mx.float32) * inv_temperature
+    order = mx.argsort(-top_vals)
+    ids = mx.take(top_idx, order)
+    log_weights = mx.take(top_vals, order)
+    bad = mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row)))
     top_p = float(config.top_p or 1.0)
     if 0.0 < top_p < 1.0:
-        order = mx.argsort(-top_vals)
-        sv = mx.take(top_vals, order)
-        sp = mx.softmax(sv)
-        # nucleus keep-rule incl. the first probability that crosses top_p
+        # nucleus keep-rule incl. the first probability that crosses top_p,
+        # on the FULL-vocabulary softmax (the reference law), not the k-slice
+        log_total = mx.logsumexp(row.astype(mx.float32) * inv_temperature)
+        sp = mx.exp(log_weights - log_total)
         keep_n = mx.maximum(mx.sum((mx.cumsum(sp) - sp) < top_p), 1)
-        sv = mx.where(mx.arange(k) < keep_n, sv, mx.array(float("-inf")))
-        local = mx.random.categorical(sv[None], key=key)[0]
-        return mx.take(top_idx, mx.take(order, local))
-    local = mx.random.categorical(top_vals[None], key=key)[0]
-    return mx.take(top_idx, local)
+        log_weights = mx.where(
+            mx.arange(k) < keep_n, log_weights, mx.array(float("-inf"))
+        )
+    return ids, log_weights, bad
+
+
+def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
+    """Device-side shaped sampling returning a LAZY scalar token array — the
+    pipelined-AR lane's sampler (shaping: :func:`_mx_lazy_shape`).
+
+    The randomness stream is mx.random keyed from the request seed instead
+    of the numpy generator, so runs stay deterministic per seed but the
+    streams differ. Callers gate on temperature > 0 and 1 < top_k < vocab.
+
+    A row with NaN or +inf (or all -inf) returns -1 instead of a token so the
+    lane raises NonFiniteLogitsError when it reads the value, rather than
+    emitting token 0 (``!``); the check rides the same lazy graph, so the
+    pipeline keeps its one sync per token.
+    """
+    ids, log_weights, bad = _mx_lazy_shape(row, config)
+    local = mx.random.categorical(log_weights[None], key=key)[0]
+    # argpartition ids are uint32; the sentinel needs a signed token
+    token = mx.take(ids, local).astype(mx.int32)
+    return mx.where(bad, mx.array(-1, dtype=mx.int32), token)
 
 
 def _greedy_draft_token_and_top_values(
@@ -7017,6 +7092,13 @@ def generate_ar(
                     target_eval_time += wait_elapsed
                     target_decode_time += build_elapsed + wait_elapsed
                     verify_calls += 1
+                    if v < 0:
+                        # _mx_lazy_sample's non-finite sentinel: the row that
+                        # produced this token carried NaN/inf.
+                        raise NonFiniteLogitsError(
+                            "non-finite logits in the pipelined AR lane at "
+                            f"output token {_lane_committed}"
+                        )
                     step = _lane_committed
                     tokens.append(v)
                     emit_token(v)
@@ -9904,6 +9986,7 @@ def generate_mtpk(
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
+    ccopy_capacity_growths = 0
     ccopy_disabled_reason = None
     if _ccopy_whole_moe_conflict:
         # Requested the target_prefix takeover but whole-MoE is installed:
@@ -10292,6 +10375,20 @@ def generate_mtpk(
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
             if stop_origin is None and _is_stop(primary, stop_token_ids):
                 stop_origin = "primary"
+            # The primary that ends the response here -- freshly sampled from
+            # the last row, or a deferred correction / bonus folded into this
+            # cycle -- has been COMMITTED but never FORWARDED: the verify that
+            # would have consumed it never runs. Re-arm it as the pending
+            # primary so the final-pending commit below extends the trunk
+            # cache (and the committed MTP history) by exactly this token.
+            # Without it the banked generation-final state is one token short
+            # of the prompt+tokens key the server files it under, and the
+            # next warm turn decodes as if this turn's terminator never
+            # existed; positions stay contiguous so nothing downstream can
+            # tell (three audits, 2026-09-07/08; the greedy deferred
+            # correction was the common trigger, temperature-0 agent clients
+            # such as Cline hit it every turn).
+            pending_primary = int(primary)
             emit_round(event)
             emit_trace()
             break
@@ -10540,6 +10637,15 @@ def generate_mtpk(
                                 committed_count=len(tokens) - 1,
                                 window_tokens=_cc_T,
                             )
+                        # Generic (non fixed-M4) banks reserve nothing for a
+                        # copy window; grow their fixed buffers before the
+                        # forward builds its mask. Without this a block that
+                        # straddled the growth edge lost its rows past the
+                        # end (functional clamp) or failed the write.
+                        _cc_grown = ensure_eager_window_capacity(cache, _cc_T)
+                        if _cc_grown:
+                            ccopy_capacity_growths += 1
+                            event["ccopy_capacity_growth"] = int(_cc_grown)
                         _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
                             mx.array([[primary] + _cc_block]),
                             cache=cache,
@@ -10830,6 +10936,22 @@ def generate_mtpk(
                     if family_capture_commit_active
                     else contextlib.nullcontext()
                 )
+                # Reserve the block's rows before the forward: the fixed-M4
+                # bank's window for its QSA entries, and the dense fixed
+                # buffers for everything else. A restored entry carries only
+                # its step rounding as slack, and the first rounds after a
+                # restore can be copy rounds, so the block used to overrun
+                # the buffer (clamped silently before the in-place write).
+                if compiled_verify_bank is not None:
+                    compiled_verify_bank.reserve_fixed_m4_window(
+                        cache,
+                        committed_count=len(tokens) - 1,
+                        window_tokens=_cb_T,
+                    )
+                _cb_grown = ensure_eager_window_capacity(cache, _cb_T)
+                if _cb_grown:
+                    ccopy_capacity_growths += 1
+                    event["ccopy_capacity_growth"] = int(_cb_grown)
                 started_forward = time.perf_counter()
                 with (
                     attention_phase("decode_verify"),
@@ -13523,6 +13645,21 @@ def generate_mtpk(
         and pending_primary is not None
         and tokens
         and repetition_result is None
+        and a3b_rebase_state is not None
+    ):
+        # The compiled A3B routes keep the accepted-prefix state in a stash
+        # that only their next verify installs; the live trunk cache still
+        # holds the rejected rows. A one-row forward_ar from it would land
+        # the pending token on the wrong positions, so leave pending_primary
+        # set: the final state below reports safe_to_commit=False and the
+        # bank declines this turn (a cold/near-prefix next turn, never a
+        # corrupted one).
+        events.append({"final_state_capture_skipped": "a3b_rebase_pending"})
+    elif (
+        capture_final_state
+        and pending_primary is not None
+        and tokens
+        and repetition_result is None
     ):
         try:
             pending_token = int(pending_primary)
@@ -13861,6 +13998,7 @@ def generate_mtpk(
         context_copy_accepted_blocks=ccopy_blocks_accepted,
         context_copy_accepted_tokens=ccopy_accepted,
         context_copy_suspensions=ccopy_suspensions,
+        context_copy_capacity_growths=ccopy_capacity_growths,
         context_copy_suspended=len(tokens) < ccopy_suspend_until,
         context_copy_backoff_tokens=ccopy_backoff if ccopy_index is not None else 0,
         context_copy_disabled_reason=ccopy_disabled_reason,

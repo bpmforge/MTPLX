@@ -4,6 +4,424 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.11.3] - 2026-09-17
+
+### Added
+
+- **Ordered model library directories** (PR #387, Philip John Basile;
+  issue #388). One primary model folder (downloads and Forge output go
+  there) plus an ordered list of additional read-only folders that the app
+  and the CLI both search: the first complete copy wins, duplicates are
+  collapsed by real path, and an unplugged drive is skipped instead of
+  crashing. The app has a Settings card for the folders (localized in all
+  thirteen languages); the CLI takes `--model-search-dir` (repeatable) or
+  `model_dirs` in `~/.mtplx/config.toml`, and `MTPLX_MODEL_DIRS`;
+  `mtplx doctor` lists the roots. A download or Forge build into a folder
+  whose volume is not mounted now says so instead of `Permission denied`.
+
+- **`mtplx gc` reclaims orphaned SSD session-cache files** (PR #502,
+  ArctifoxNL; issue #493). `mtplx gc` reports the live entries, the bytes on
+  disk and everything in `~/.mtplx/session-bank/` that the manifest no
+  longer reaches; `--apply` deletes it, `--force` allows that beside a
+  running daemon, `--json` is machine-readable and `--dir` points it at
+  another store. It needs neither MLX nor a model. The walk it runs is the
+  same one the daemon uses (`mtplx/cache_bank/reconcile.py`), so the command
+  and the engine cannot disagree about what is garbage.
+- **Idle limit for the warm session cache** (issue #481). Nothing in the
+  daemon dropped warm state on a five- or ten-minute clock (the only idle
+  timer is one hour; the ten-minute window orders eviction victims under
+  pressure), but the limit was not adjustable and none of the cache
+  variables were documented. `MTPLX_SESSION_BANK_IDLE_TTL_S` now sets the
+  idle limit (`0` keeps entries until memory needs them), and the five
+  `MTPLX_SESSION_BANK_*` variables are documented together in
+  `docs/server.md`. `/health` and the dashboard stream report
+  `idle_ttl_s` as `null` when the sweep is off; the stream used to write
+  a bare `Infinity`, which a browser's JSON parser rejects, so every live
+  dashboard snapshot was unparseable with the knob at `0`.
+- **`mtplx doctor` names the runtime that answers** (issue #479). A new
+  `runtime.identity` check reports the MTPLX version and path the doctor
+  imported, the `mtplx` first on PATH and whether it runs the same
+  interpreter (an installer shim or Homebrew venv ahead of a source
+  checkout is a warning with `which -a mtplx` as the fix), and the GPU
+  architecture with whether the M5 tensor-unit route is available. The
+  issue's kernel-build failure on macOS 15 is unreachable on 2.11.2 code;
+  the check answers which MTPLX actually ran.
+- **Responses API** (PR #219, Philip John Basile). `POST /v1/responses` is served as
+  a stateless, text-only adapter over the chat runtime, covering
+  client-executed function, custom and namespace tools, with SDK-backed
+  tests. `docs/api.md` carries the Codex CLI settings that make its first
+  request work (hosted web search off, image generation off, a dedicated
+  `CODEX_HOME` so installed Codex apps do not add their connector schemas).
+- **Models in the shared Hugging Face cache are found** (issue #445). The
+  model resolver consults `HF_HOME` / `HF_HUB_CACHE` after MTPLX's own
+  cache, honours `HF_HUB_OFFLINE`, and holds the copy to the same
+  completeness check, so a pack already downloaded with the Hugging Face
+  CLI is served without a second download; Forge builds from the local
+  copy first and stamps the revision it built from.
+- **aria2 download backend as an opt-in** (PR #452, zeeshanhaque21).
+  `mtplx pull --download-backend aria2` uses aria2c for multi-connection
+  pulls and fails with an install hint when aria2c is missing;
+  `--download-backend auto` picks aria2c when it is installed. The built-in
+  downloader stays the default.
+- **Appearance row localized.** The Settings row for Appearance (its title,
+  caption and the System, Dark and Light segments) was English in every
+  language; it now follows the app language in all thirteen tables.
+- **Chat sidebar and Forge timestamps follow the app language.** The
+  relative times under each chat row and in the Forge tab were formatted
+  in the macOS locale, so a Turkish app still read "in 0 sec"; both now
+  use the active app language.
+- **Launch chooser, Hermes overlay and tune-step captions localized.** Five
+  captions (the launch chooser's "Pick how you want to use it." and custom
+  client note, the Hermes auto-approve, install-status and Terminal notes,
+  and the tune step's ready line) were English in every language; the ten
+  strings now resolve through the app language in all thirteen tables.
+- **Forge buttons localized.** The Retry verify, Discard and Use it now
+  buttons in the Forge verify and registered stages were English in every
+  language; they now follow the app language.
+- **Turkish** (issue #470). The app ships a thirteenth language table
+  (Türkçe, 1,562 strings) next to the twelve from 2.11.
+- **Remove a stale custom model from the picker** (PR #471, nRanzo). A
+  persisted custom model whose files are gone can be removed from the
+  picker with a right-click and a confirmation; official, installed and
+  currently selected models cannot. Nothing on disk is touched.
+- **README model table** (issues #238, #408). Every shipped pack with its
+  Hugging Face repo, the smallest Mac it is offered on next to its measured
+  peak serving memory, what it is for, and the profile and depth MTPLX
+  resolves on its own; two tests keep the table equal to the catalog.
+
+- **A bounded request replay tool.** `scripts/replay_chat_request.py`
+  replays a captured chat request against a daemon with an explicit output
+  budget, so a 100k-token agent turn can be re-measured without re-running
+  the agent's tools.
+
+### Fixed
+
+- **A conversation with tools stays warm from turn to turn.** The app's
+  JSON encoder wrote the keys of its tool declarations in a different order
+  on every request and the native template rendered that order verbatim,
+  so an 18,776-token web-search conversation prefilled from the start on
+  every turn (14.7 s and 15.2 s to the first token, 0 cached tokens). Tool
+  schemas are put into one fixed key order once, at the server boundary, with
+  every field, value and list order preserved; a `tool_choice: none` turn keeps the
+  declarations in the prompt and on the same cache identity while calls
+  stay disabled; and the server's request-only closing instruction is no
+  longer banked as client history (that alone replayed a 2,820-token
+  answer, 2.8 s). Replayed 19k-token turns against the same build without
+  the fix: 15.26 s to 0.57 s and 13.93 s to 0.66 s to the first token;
+  installed-app follow-ups at 0.29 s and 0.28 s with 11,421 and 12,510
+  cached tokens. Seven regression tests across the app, OpenCode, Pi and
+  Hermes. A conversation older than this release prefills once more on
+  its first turn.
+- **Agent launches no longer override the model's verify path, and the
+  adaptive depth policy no longer learns a startup spike as its recurring
+  cost.** The app's OpenCode, Pi and Hermes presets and the CLI launchers
+  exported `MTPLX_LAZY_TARGET_DISTRIBUTIONS=1` and
+  `MTPLX_LAZY_BONUS_VERIFY=1` from an older tuning, which on Flash-Next
+  switched off the batched compiled verifier the chat launch already used;
+  both exports are gone and the model's defaults apply (explicit operator
+  exports still win, other families keep their profile defaults). The
+  expected-value depth policy seeded its cost estimate with a one-off
+  125 ms first call (the next three were 30 to 31 ms) and chose the slower
+  eager path for 453 of 464 cycles; it now calibrates on the minimum of its
+  four warm-up samples before the weighted average starts, and a sustained
+  rise still lowers the depth. A 108,919-token OpenCode turn, four
+  alternating runs against the same build without the change: 48.83 to
+  61.77 tok/s (+26.5 percent), compiled verify calls 11 to 376 per 1,024
+  output tokens, memory flat; 200,073 tokens hold at about 50 tok/s.
+- **OpenCode 2 loads the MTPLX session-header plugin** (issue #498). The
+  plugin is a small package with the version 1 entrypoint and a version 2
+  `setup` hook scoped to the MTPLX provider; 1.18.29 and 2.0.5 clients both
+  send the headers, the managed registration migrates in place and other
+  plugins are preserved.
+- A conversation whose generation-final snapshot was refused for size (over the per-session cap, issue #499's 48 GB shape) reports that refusal as the next turn's `cache_miss_reason` (`oversized_snapshot_skipped`) and in the bank's `last_oversized_skip`; it used to surface as the cold tier's `ssd_prefix_miss`.
+
+- **A busy daemon is no longer killed as dead** (issue #487, HenriGrimm).
+  The app's watchdog killed a live daemon whose generation-final prefix
+  commit took 19-25 s on a 110-150k vision agent session: two missed health
+  probes were read as death while the commit succeeded. The watchdog now
+  reaps only when the daemon's process is gone, its port stops accepting
+  connections, or it has been silent for 90 s; a refresh or a chat stream
+  that fails once goes through the same check. The slow commit itself is
+  fixed too: a prompt whose screenshots exceeded the vision embed cache's
+  row budget evicted its own images and re-ran the tower for every one on
+  the model-owner thread; the prompt's images are pinned for the pass, and
+  the commit records the wall of each phase in the flight event so a slow
+  commit names its phase.
+- **Gemma 4 warm turns restore across rewritten conversation turns**
+  (PR #283, Craig Tollifson). The Gemma 4 prompt path now uses the session
+  bank's near-prefix restore, so an edited or re-rendered turn no longer
+  re-prefills the whole conversation. Two exactness holes in the sliding
+  window trim it relies on were closed on the way in: a restored entry's
+  trim outside the last-update rollback left stale rows in the buffer that
+  the next step counted as history, and the bank's identity for a Gemma 4
+  entry now comes from the runtime's declared history policy, never a
+  literal, so AR-only sessions cannot hit a policy mismatch.
+
+- **A wedged daemon of the app's own no longer moves the configured port,
+  and a port fallback is never saved** (issue #503). After a hard freeze
+  the daemon's listener could survive while `/health` stopped answering;
+  the app's port preflight read that as "another app", moved to the next
+  free port, saved the new port to settings, and every client pinned to
+  the configured port (an agent connector on 8001) was stranded for good,
+  with the engine showing Running. The preflight now asks the OS who holds
+  the port: a listener carrying the app's own launch marker in its
+  environment is stopped in place and the configured port is kept. For a
+  genuinely foreign occupant the launch still moves to a free port, but
+  only for that launch: settings keep the configured port, a save made
+  meanwhile writes the configured port back (changing the port on purpose
+  still wins), the banner stays until the next start, and the next start
+  tries the configured port again. A listener without the marker (a
+  stranger's app, a CLI-started `mtplx serve`) is never signalled.
+- **Deep-context sessions persist on the machines that can restore them**
+  (PR #496, Dizzler7). A 12 GiB warm snapshot (Qwen3.8-27B, Q8 KV, more
+  than 100k tokens) was refused by the flat 8 GiB per-session cap on Macs
+  under 96 GB, so those sessions never reached the SSD tier and came back
+  cold after a restart. The per-session cap is now sized by the memory
+  plan: two thirds of the bank budget, held under half of what the engine
+  budget leaves after the weights and the runtime transients (a restore
+  holds the snapshot next to its banked copy): 13.2 GiB on a 64 GB Mac with
+  the 27B, 32 GiB on a 128 GB Mac with the 27B, 10.5 GiB with Flash-Next.
+  The PR's flat 32 GiB would have pushed a 64 GB Mac into swap; the
+  flat fallbacks for a machine without a plan are unchanged. From the same
+  PR: 64 GB Macs with 150 GiB of free disk default the SSD cap to 100 GiB
+  instead of 32, and the hourly SSD write budget default is 128 GiB (was
+  64).
+- **Remote Qwen checkpoints without MTP weights inspect as autoregressive,
+  and Forge refuses to build speculative artifacts from them** (PR #489,
+  Philip John Basile). A Hugging Face checkpoint whose listing carried every
+  trunk shard but no draft head (`nex-agi/Nex-N2.5-mini`) was reported as
+  `missing-model-weights` because the trunk check only looked at a local
+  directory; inspection now uses the same local-or-remote trunk check and
+  reports the model as runnable with MTP off. Forge's runtime probe treated
+  `can_run` as MTP evidence and admitted AR-only trunks into a speculative
+  conversion that cannot create the missing trained head; it now requires
+  MTP weight evidence and says so.
+- **SSD cache eviction yields to active requests.** A populated cache could
+  keep scanning and deleting old snapshots during the next reply, competing
+  with generation. Eviction now releases the store lock before waiting,
+  reclaims retired snapshots in bounded batches, and reads surviving blob
+  references once per pass instead of once per evicted entry. Concurrent
+  writes and shared blobs remain protected. The shared server fix applies
+  to the native app, OpenCode, Hermes, and Pi.
+- **The SSD session cache reconciles itself and its cap means the whole
+  directory** (issue #493; three reports: 394,155 orphaned blobs, 44.1 GB,
+  against 17 entries after three weeks; 471,541 blobs, 67 GB, on a 60 GB cap
+  after three days of uptime). The reconciliation that deletes files the
+  manifest no longer reaches only ran when a write found the store near its
+  cap, which a generous cap never reached; and after each cleanup the cap
+  check assumed every unaccounted byte was gone, although blobs still shared
+  by a later snapshot of the same conversation stay on disk when the entry
+  that paid for them is evicted, so the directory could sit above
+  `--ssd-session-cache-max-size` for good. The daemon now reconciles the
+  store in the background every time it opens the cache (yielding to
+  requests, never blocking the boot or the first request; one
+  `mtplx_ssd_session_cache_reconcile` line in the daemon log says what it
+  reclaimed), the cap check counts the directory as it is on disk, reclaims
+  garbage on the writer thread before it would evict live entries for the
+  room, and never walks the store on the request thread. Blobs of a write in
+  flight, and blobs a row committed during a pass names, are never deleted.
+  `docs/server.md` documents the cap, the pass and `mtplx gc`.
+- **A reply's own whitespace no longer breaks its warm restore.** The
+  visible content of a reply is served with its leading and trailing
+  whitespace removed, so a client's echo could never carry the model's
+  own whitespace tokens; a turn cut by the token budget after a newline
+  came back with the end-of-turn marker where the newline was, the
+  exactness rule refused the restore and the next request re-prefilled
+  the whole turn. The committed-id splice now puts the model's own
+  whitespace back, and it also runs when thinking is off.
+- **Copied blocks at the verify cache's growth edge kept their rows.** The
+  context-copy path verified a copied block through the fixed-capacity
+  buffers of the compiled verify; a block that straddled the buffer's end (a
+  512-token growth grant on the 27B, the rounding slack of a freshly
+  restored Flash-Next entry) was written with a functional slice update that
+  silently drops the rows past the end, so the rest of the turn attended
+  over missing rows (an answer cut off mid-statement, or a file written
+  twice, was the visible symptom). Both copy-block routes reserve their rows
+  before the forward and the write grows the buffers as a last guard.
+- **Flight recorder counts non-streaming requests.** A non-streaming
+  chat completion fed the recorder no token events, so `mtplx trace`
+  showed a 24k-token generation as a prefill with zero tokens for its
+  whole life. Non-streaming requests now report their tokens as they
+  are produced, the same as streamed ones.
+- **OpenCode compacted after every reply on small context windows** (issue
+  #480). MTPLX registered the model with OpenCode with the reply limit equal
+  to the context window; OpenCode reserves the reply limit out of the window
+  before deciding whether the conversation still fits, so on an 8K window
+  the usable conversation was zero tokens and OpenCode wrote its
+  `## Objective / Important Details / Work State` summary after every turn
+  (48 summaries in 98 turns in the report). `mtplx connect opencode`, the
+  quickstart and the app now advertise a reply budget of half the window,
+  capped at the 32,000 OpenCode uses on large windows, so compaction happens
+  only when the conversation is near the limit.
+- **261,120-token prompts decode on Flash-Next** (PR #482, davidtai). At
+  the pack's full context the first speculative verify step ran out of GPU
+  memory after the whole prompt had been read: the verify's KV-cache update
+  reallocated the entire cache buffer on every step (about 6.4 GB across the
+  twelve full-attention layers at that context), and its multi-row
+  attention built a score table that grows with the context. The KV update
+  now writes its rows into the existing buffer (exact; the compiled verify
+  path and the rollback are unchanged), and the verify attention is split
+  across query-head groups so each call stays on the fused kernel in the
+  three-to-eight-row band the verify uses (exact per group;
+  `MTPLX_QWEN4_VERIFY_SDPA_HEAD_CHUNK=0` turns it off; `/health` reports
+  `verify_sdpa_head_chunk` when it engages). Speed and peak memory at 16k
+  are unchanged; the 27B models are not affected.
+- **The Flash-Next converter accepts the official FP8 checkpoint** (PR
+  #474, Graham Jenkins). Qwen's Flash-Next-FP8 revision stores one shared
+  scalar scale for its 128 n-gram embedding shards instead of per-block
+  scales; the converter now falls back to that scalar for n-gram shards and
+  accounts for it, with regression tests for both layouts.
+- **Flash-Next block verification is exact at every depth.** Three
+  independent audits enumerated the block-verify acceptance rule on tiny
+  vocabularies and found it exact at depths 1 and 2 but off by up to 4e-2
+  total variation at depth 3, in the cases where the last depth's acceptance probability had
+  been clipped to 1. The ladder now caps the reach budget by the realised
+  reach, propagates that feasible budget, and corrects a rejection from the
+  shortfall the acceptance probabilities leave; an enumeration test compares the emitted joint
+  distribution with the target for both rules at depths 1 to 4 (exact to 1e-12).
+- **Warm agent turns on hybrid models restore the recurrent state exactly.**
+  A near-prefix restore whose gap to the banked turn was 1 to 8 tokens (the
+  shape of a re-rendered agent turn) trimmed the attention KV but kept the
+  GDN state from the longer sequence, then re-ran one token on it; the whole
+  turn decoded on state the new prompt never produced and later turns
+  inherited it, on the 8-bit Quality pack exactly like the 4-bit ones. Every
+  partial restore of a recurrent entry now lands on a stored recurrent
+  boundary at or below the match point.
+- **The banked state after an MTP turn covers every committed token.** The
+  final token that ended a response (a deferred greedy correction, a fresh
+  sample, or any max_tokens exit) was committed but never forwarded, so the
+  banked state was one token short of the key it was filed under and the
+  next warm turn decoded as if the terminator never existed (temperature-0
+  clients such as Cline hit it every turn). The final token is now
+  forwarded before the state is banked.
+- **Non-finite logits fail loudly** instead of becoming token 0, which is
+  `!` in the Qwen vocabulary (the thousands of exclamation marks of issue
+  #311). The request ends with `finish_reason: error`, code
+  `non_finite_logits`, a message with the NaN/inf counts, the session's
+  cached state is dropped, and the daemon stays up. A row that constrained
+  decoding masks to -inf with a finite winner is legitimate and passes the
+  guard.
+- **The Flash-Next AR sampler follows the reference nucleus rule.** The
+  pipelined AR sampler measured top-p on the top-k slice alone, keeping one
+  to five fewer of the top-20 tokens than the other sampling paths at 1.0/0.95/20;
+  it now measures the nucleus on the full-vocabulary softmax like the CPU
+  reference (test: identical supports, total variation below 1e-5).
+- **Hindi, Thai and vowelled Arabic tokenize as the model was trained.**
+  transformers' Qwen2Tokenizer replaced the packs' pre-tokenizer regex with
+  its Qwen2-era one, splitting combining marks off their letters (Hindi 32
+  tokens instead of 20, Thai 17 instead of 9, Arabic 45 instead of 31 on the
+  same sentences; Latin, code and Chinese unchanged), and the six 27B packs
+  shipped that regex baked into tokenizer.json. The loader restores the
+  Qwen3 regex on every Qwen3-family pack.
+- **32 GB Macs get a working draft head** (issue #483, HeyCocoa). The
+  fast draft LM head was built through a 2.4 GiB dense intermediate; on an
+  M1 Pro 32 GB the requantize hit a silent Metal out-of-memory and the head
+  read back as zeros, collapsing MTP acceptance to under 1%. The head is
+  now built in row chunks (bit-identical result, no dense intermediate), a
+  zeroed head is refused, and the install falls back to the resident target
+  head as the drafter.
+- **A long agent turn stays warm across the model's own token seams.** A
+  model's sampled tokens are not always the standard encoding of their own
+  text: in a Hermes session at effort xhigh the 27B wrote `"Nothing` as one
+  token 8,498 tokens into a write_file call where the tokenizer encodes `"`
+  then `Nothing`. The client's re-tokenized history then diverged from the
+  committed stream on identical bytes, the generation-final snapshot was
+  refused, the fallback re-prefill was preempted by the next request, and
+  that request re-prefilled the whole 29,842-token turn (30,038 tokens,
+  41 s to first token). Wherever the resent prompt and the session's
+  committed ids decode to the same text, the committed ids are now served
+  (a bounded window per seam, never across a real edit), on both the
+  request and the snapshot side; the request log carries `token_splice`
+  under `committed_reasoning_canonicalization`.
+  `MTPLX_COMMITTED_TOKEN_SPLICE=0` restores the old behaviour.
+- **A mid-conversation system message no longer rewrites message 0**
+  (issue #477). Claude Code's per-turn `<system-reminder>` notes arrive as
+  late system messages; hoisting them into the leading system message
+  changed the first message every turn and cost a cold re-prefill of the
+  whole history. A late system message now becomes a user turn in place.
+- **The Flash-Next serving optimizations reach a served daemon.** Four
+  hot-path settings (`MTPLX_QWEN4_OPDIET`, `MTPLX_QWEN4_VERIFY_GLUE`,
+  `MTPLX_QWEN4_DRAFT_K20_PRESCATTER`, `MTPLX_QWEN4_BLOCK_VERIFY`) were read
+  once at import, before the server applied the Flash-Next defaults,
+  so `/health` reported them configured while the daemon ran with all four
+  off (davidtai's PR #475 found the same problem). The settings are
+  re-read when the model's runtime env is applied, before the load. Three of
+  them are on by default; the exact block verify
+  (`MTPLX_QWEN4_BLOCK_VERIFY`) is an opt-in export, because on a
+  45,000-token reasoning turn at effort xhigh it accepted 3.5 percent fewer
+  draft tokens per round than the standard verify across alternating
+  boots (both are distribution-exact; the faster one is the default).
+- **Reasoning substitution checks the whole tool call.** The
+  committed-reasoning canonicalizer compared tool calls by their loop key
+  (command or path only), so a `write` to the same file with new content
+  passed the check and the prompt was served with the old body. The check now
+  compares the complete argument set in both markup dialects.
+- **Desktop web views can be allowlisted for CORS** (issue #473). The
+  origin validator accepted only `http` and `https`, so
+  `--cors-origin tauri://localhost` (Jan.app) and `MTPLX_CORS_ORIGINS`
+  entries such as `app://obsidian.md` were refused as invalid and the
+  requests got a 403. Any scheme is an origin scheme now; a wildcard, a
+  bare host, a path, a query or credentials are still refused, and the
+  allowlist still never opens `/admin` or the browser sign-in routes.
+- **Request-capture registry no longer grows for the life of the daemon**
+  (noticed in PR #356, PhilipJohnBasile). With `MTPLX_REQUEST_CAPTURE_DIR` set, the in-memory map from request id
+  to capture file kept an entry for every request ever captured, including
+  the ones the ring had already moved to `pruned/`; it now forgets an id
+  as soon as its file leaves the ring.
+- **Streams held for minutes when the first line looked like tool-control
+  markup** (issue #468). An answer whose first line was a bare name such as
+  `value` or `value=abc` stayed in the orphan-marker hold until the stream
+  finished. A bare tool-control line closes on its own line, so the hold is
+  released as soon as the first line closes.
+- **Retrieval models are validated at startup** (issue #445 audit). A
+  missing `--embedding-model` or `--reranker-model` used to boot a daemon
+  that answered the first `/v1/embeddings` request with a 500 and a
+  traceback; the CLI and the server module now refuse to launch with the
+  `mtplx pull` hint, a checkpoint that disappears later surfaces as a
+  structured 404, and `/v1/models` lists only retrieval models that
+  resolved. Retrieval models are also found in the shared Hugging Face
+  cache.
+- **Dashboard request log** (issue #401). The per-depth acceptance card
+  prints real accepted and drafted totals, and the when column shows the
+  completion time of every recorded request, cancelled and disconnected
+  rows included.
+- **`mtplx connect opencode` follows the live daemon** (issue #472). The
+  command names a host and a port, not a pack, so it now takes the model id
+  and the image-input flag from the daemon that answers there; an explicit
+  `--model-id` still wins, and without a daemon the pack metadata for the id
+  in hand answers as before. 2.11.2 already advertised image input from the
+  pack metadata; the port-only form assumed the catalog default id.
+- **`/health` fast-path checks against the server's own overrides.** The
+  Flash-Next path keeps the verify snapshot and pins the batched target
+  distributions on purpose, and `/health` reported those three keys as
+  `ok: false` against the profile block. The expectation is now the
+  runtime override the server resolved, with the entry naming its source
+  and the profile value it replaced.
+- **Hermes profile warning on every launch.** Hermes v0.21 deprecates the
+  `TERMINAL_CWD` line in `.env`; the CLI profile writer and the app no
+  longer write it. The working directory reaches Hermes through
+  `terminal.cwd` in its config, as before.
+- **Flash-Next agent launches draft to the chosen depth.** With the
+  Adaptive depth switch unset, the app's Pi and Hermes launches no longer
+  turn on the expected-value depth policy for Flash-Next: measured on the
+  shipped 2.11.2 settings, the policy decodes 7 to 8 percent slower than a
+  fixed depth 3 at 2k and at 19k tokens of context, and the 27B pair is a
+  tie, so the 27B presets are unchanged. The switch still turns the policy
+  on explicitly.
+
+### Changed
+
+- **transformers floor raised to 5.10.0** (Dependabot alert 24, the
+  `save_pretrained` path-traversal range); the lock moves to 5.14.1.
+- **The dead M=8 K-split verify kernel is removed** (issue #322). Nothing
+  dispatched `nax_qmm_m8` since it landed (0.51-0.87x of stock on every
+  live shape); the evidence stays as a comment beside the M=16 eligibility
+  helper so the closed branch is not re-litigated.
+- **Docs.** The adaptive depth policy flag (`docs/server.md`), the request-capture
+  ring size (`MTPLX_REQUEST_CAPTURE_KEEP`), the reasoning effort surfaces
+  (`docs/api.md`, issue #484) and the OpenCode CLI's per-turn system-prompt
+  rebuild with its measured cost (`docs/perf`) are documented.
+
 ## [2.11.2] - 2026-09-06
 
 A correctness release for every Mac that is not an M5, seven session-bank

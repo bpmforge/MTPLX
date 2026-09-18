@@ -278,7 +278,7 @@ struct ForgeMineView: View {
     // MARK: - Actions
 
     private func reload() {
-        let scanner = ForgeLocalIndex()
+        let scanner = ForgeLocalIndex(modelLibrary: backend.configuration.modelLibrary)
         entries = scanner.scan(includingRegistered: backend.configuration.customModels)
         if selectedID == nil { selectedID = entries.first?.id }
     }
@@ -323,7 +323,12 @@ struct ForgeMineView: View {
     private func removeFromPicker(entryID: String) {
         guard let entry = entries.first(where: { $0.id == entryID }) else { return }
         var config = backend.configuration
-        config.customModels.removeAll { $0.localCandidates.contains(entry.localPath) }
+        let modelIDs = config.customModels
+            .filter { $0.localCandidates.contains(entry.localPath) }
+            .map(\.id)
+        for modelID in modelIDs {
+            config.removeCustomModel(id: modelID)
+        }
         try? backend.saveSettings(config)
         reload()
         if selectedID == entryID {

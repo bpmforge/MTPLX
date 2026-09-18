@@ -287,22 +287,34 @@ def _accept_loop_source(source: str) -> str:
     return source[start:end]
 
 
-def test_the_gate_is_read_at_use_and_only_in_one_place():
+def test_the_gate_is_read_at_import_and_by_the_runtime_refresh_only():
     source = _generation_source()
-    # generation.py consults the reader at USE, not a module constant frozen
-    # at import: the served fixed-M4 auto-arm stamps the key after import, so a
-    # frozen constant would leave the lane off as launched (arming audit).
-    assert "_qwen4_block_verify_enabled()" in source
-    assert "_QWEN4_BLOCK_VERIFY = " not in source
-    # generation.py never reads the env var itself.
+    assert source.count("_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()") == 2
+    # generation.py never reads the variable itself.
     assert 'os.environ.get("MTPLX_QWEN4_BLOCK_VERIFY"' not in source
     assert '_env_truthy("MTPLX_QWEN4_BLOCK_VERIFY")' not in source
     module = (REPO_ROOT / "mtplx" / "qwen4_block_verify.py").read_text()
     assert module.count('_ENV_VAR = "MTPLX_QWEN4_BLOCK_VERIFY"') == 1
-    # the env is read in exactly one place (is_enabled), at use.
-    assert module.count("_env_truthy(_ENV_VAR)") == 1
+    # one read at import, one in refresh_from_env, nothing on the hot path
+    assert module.count("_read_gate(") == 3
     assert "os.environ" not in inspect.getsource(bv_mod.BlockVerifier)
     assert "os.environ" not in inspect.getsource(bv_mod.build_verifier)
+
+
+def test_the_runtime_refresh_arms_the_gate_after_import(monkeypatch):
+    from mtplx import generation, runtime_options
+
+    monkeypatch.setattr(bv_mod, "_ENABLED", False)
+    monkeypatch.setattr(generation, "_QWEN4_BLOCK_VERIFY", False)
+    receipt = runtime_options.refresh_env_flags({"MTPLX_QWEN4_BLOCK_VERIFY": "1"})
+    try:
+        assert receipt["MTPLX_QWEN4_BLOCK_VERIFY"] is True
+        assert bv_mod.is_enabled() is True
+        assert generation._QWEN4_BLOCK_VERIFY is True
+    finally:
+        runtime_options.refresh_env_flags({})
+    assert bv_mod.is_enabled() is False
+    assert generation._QWEN4_BLOCK_VERIFY is False
 
 
 def test_the_shipped_law_survives_verbatim_in_the_accept_loop():
@@ -440,6 +452,9 @@ def test_the_ladder_is_bit_identical_to_the_reference_ladder():
     np.testing.assert_array_equal(verifier.budget, columns["budget"])
     np.testing.assert_array_equal(verifier.realised, columns["realised"])
     np.testing.assert_array_equal(verifier.clipped, columns["clipped"])
+    np.testing.assert_array_equal(
+        verifier.residual_draft_scale, columns["draft_scale"]
+    )
 
 
 def test_the_ladder_actually_leaves_one_and_buys_reach():
@@ -477,6 +492,7 @@ def test_the_correction_is_the_scaled_residual_the_reference_builds(depth):
         draft_ids,
         draft_probs,
         scale=np.float64(verifier.residual_scale[depth]),
+        draft_scale=np.float64(verifier.residual_draft_scale[depth]),
     )
     if expected is None:
         # The reference falls back to the double-normalised target row when

@@ -196,14 +196,18 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-#: ``None`` = resolve from the environment on each read; a test may force a
-#: bool via :func:`_configure_for_test`. Read at USE, never at import: the
-#: server's fixed-M4 auto-arm stamps MTPLX_QWEN4_DRAFT_K20_PRESCATTER into the
-#: environment AFTER this module is imported (via mtplx.server.openai's
-#: generation import), so an import-time read froze the default (off) and the
-#: served lane never engaged -- the arming audit, 2026-09-07. The env is frozen
-#: once serving starts, so a per-call read returns the same value every time.
-_ENABLED = None
+#: Read at import and re-read by :func:`refresh_from_env` when the server
+#: installs a model family's runtime env (before any model load).
+_ENABLED = _env_truthy(_ENV_VAR)
+
+
+def refresh_from_env(env: Any | None = None) -> bool:
+    """Re-read the gate from ``env`` (default ``os.environ``); returns it."""
+
+    global _ENABLED
+    source = os.environ if env is None else env
+    _ENABLED = str(source.get(_ENV_VAR, "")).strip().lower() in {"1", "true", "yes", "on"}
+    return _ENABLED
 
 
 def is_enabled() -> bool:

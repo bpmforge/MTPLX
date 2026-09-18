@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import os
+
 import pytest
 
 from mtplx.cli import build_parser, main
@@ -389,6 +393,23 @@ def test_probe_refuses_no_mtp_sources(tmp_path):
     assert payload["verdict"] == "no_mtp_heads"
     assert payload["forgeable"] is False
     assert payload["has_mtp_weights"] is False
+
+
+def test_probe_does_not_treat_runnable_qwen_trunk_as_mtp_evidence(tmp_path):
+    _write_json(tmp_path / "config.json", _mtp_config())
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        {"model.language_model.layers.0.mlp.down_proj.weight": mx.zeros((1, 1))},
+    )
+
+    payload = forge.probe_source(str(tmp_path))
+
+    assert payload["verdict"] == "no_mtp_heads"
+    assert payload["forgeable"] is False
+    assert payload["has_mtp_weights"] is False
+    assert payload["runtime_compatibility"] == "native-ar-only-missing-mtp"
+    assert payload["diagnostic"] == "native-ar-only-missing-mtp"
+    assert "AR-only Forge" in payload["message"]
 
 
 def test_probe_refuses_config_only_mtp_sources(tmp_path):
@@ -1015,7 +1036,11 @@ def test_build_zero_agreement_contract_still_measures_speed_rows(tmp_path, monke
     monkeypatch.setattr(
         forge,
         "_prepare_source",
-        lambda repo, run, probe: (source, "Qwen/Qwen3.5-9B", "abc123"),
+        lambda repo, run, probe, *, model_root=None: (
+            source,
+            "Qwen/Qwen3.5-9B",
+            "abc123",
+        ),
     )
 
     def fake_mirror(source_path, destination):
@@ -1336,6 +1361,108 @@ def test_discover_network_failure_mentions_hf_unreachable(monkeypatch, capsys):
 
     assert code == 1
     assert "hf_unreachable" in capsys.readouterr().err
+
+
+def test_explicit_model_root_takes_precedence_for_forge_destinations(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    forge_env_root = tmp_path / "forge-env"
+    legacy_env_root = tmp_path / "legacy-env"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(forge_env_root))
+    monkeypatch.setenv("MTPLX_MODEL_DIR", str(legacy_env_root))
+
+    assert forge._default_model_root(primary_root) == primary_root
+    assert forge._unique_model_dir("Fixture", model_root=primary_root) == (
+        primary_root / "Fixture"
+    )
+    assert forge._default_model_root() == forge_env_root
+
+    monkeypatch.delenv("MTPLX_FORGE_MODEL_ROOT")
+    assert forge._default_model_root() == legacy_env_root
+
+
+def test_prepare_hf_source_uses_explicit_model_root_as_pull_cache(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(tmp_path / "stale-forge-root"))
+    calls = []
+
+    def fake_pull(repo_id, **kwargs):
+        calls.append((repo_id, kwargs["cache_dir"]))
+        cached = Path(kwargs["cache_dir"]) / "owner--Fixture"
+        cached.mkdir(parents=True)
+        (cached / "config.json").write_text("{}", encoding="utf-8")
+        return {"path": str(cached), "size_bytes": 2}
+
+    monkeypatch.setattr(forge, "pull_model", fake_pull)
+
+    source, repo, revision = forge._prepare_source(
+        "owner/Fixture",
+        tmp_path / "run",
+        {"estimated_size_bytes": 2, "source_sha": "abc123"},
+        model_root=primary_root,
+    )
+
+    assert calls == [("owner/Fixture", primary_root)]
+    assert source == primary_root / "owner--Fixture"
+    assert repo == "owner/Fixture"
+    assert revision == "abc123"
+
+
+def test_mirrored_output_is_self_contained_after_source_removal(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    blob = tmp_path / "cache-blob.safetensors"
+    blob.write_bytes(b"payload")
+    (source / "model.safetensors").symlink_to(blob)
+    nested = source / "tokenizer"
+    nested.mkdir()
+    (nested / "tokenizer.json").write_text('{"version":1}', encoding="utf-8")
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.stat().st_ino == blob.stat().st_ino
+    assert not (destination / "config.json").is_symlink()
+    assert not (destination / "tokenizer" / "tokenizer.json").is_symlink()
+
+    shutil.rmtree(source)
+    blob.unlink()
+
+    assert payload.read_bytes() == b"payload"
+    assert (destination / "config.json").read_text(encoding="utf-8")
+    assert (destination / "tokenizer" / "tokenizer.json").read_text(
+        encoding="utf-8"
+    ) == '{"version":1}'
+
+
+def test_mirrored_output_copies_payload_when_hardlink_is_unavailable(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    source_payload = source / "model.safetensors"
+    source_payload.write_bytes(b"payload")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(forge.os, "link", cross_device_link)
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.read_bytes() == b"payload"
+    assert payload.stat().st_ino != source_payload.stat().st_ino
+    assert not list(destination.rglob(".*.tmp"))
 
 
 def test_build_local_already_mtplx_writes_phase_files_and_runtime(tmp_path, monkeypatch):
@@ -2508,3 +2635,74 @@ def test_runtime_stamp_carries_family_sampler_law(tmp_path):
     assert runtime["sampler"]["temperature"] == 1.0
     assert runtime["sampler"]["top_p"] == 0.95
     assert runtime["sampler"]["top_k"] == 20
+
+
+def test_forge_reuses_a_source_already_on_disk(tmp_path, monkeypatch):
+    """Issue #445: a repo the machine already holds must not be pulled again."""
+    from mtplx.commands import forge as forge_module
+
+    snapshot = tmp_path / "models--org--name" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path", lambda ref, cache_dir=None: snapshot
+    )
+
+    def never_pull(*args, **kwargs):
+        raise AssertionError("forge downloaded a source it already had")
+
+    monkeypatch.setattr(forge_module, "pull_model", never_pull)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    path, repo_id, sha = forge_module._prepare_source("org/name", run, {})
+    assert path == snapshot
+    assert repo_id == "org/name"
+    # The sha describes the copy that was built from, not the remote tip.
+    assert sha == "deadbeef"
+
+
+def test_forge_still_pulls_a_source_that_is_not_on_disk(tmp_path, monkeypatch):
+    from mtplx.commands import forge as forge_module
+
+    def missing(ref, cache_dir=None):
+        raise FileNotFoundError(f"Model {ref} is not cached. Run: mtplx pull {ref}")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", missing)
+    downloaded = tmp_path / "pulled"
+    downloaded.mkdir()
+    calls: list[str] = []
+
+    def fake_pull(repo_id, **kwargs):
+        calls.append(repo_id)
+        return {"path": str(downloaded), "size_bytes": 4}
+
+    monkeypatch.setattr(forge_module, "pull_model", fake_pull)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    path, repo_id, _sha = forge_module._prepare_source(
+        "org/name", run, {"source_sha": "abc"}
+    )
+    assert calls == ["org/name"]
+    assert path == downloaded
+    assert repo_id == "org/name"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can create any directory")
+def test_unique_model_dir_explains_unavailable_model_root(tmp_path):
+    # The app passes --model-root for every build; when that root sits on a
+    # drive that is not connected, the build must stop with the directory
+    # named, not a bare permission error from whichever parent refused.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    root = locked / "ExternalSSD" / "models"
+    try:
+        with pytest.raises(forge.ForgeError, match="is not available") as excinfo:
+            forge._unique_model_dir("Built", model_root=root)
+    finally:
+        locked.chmod(0o700)
+
+    assert str(root) in str(excinfo.value)
+    assert excinfo.value.code == 2
